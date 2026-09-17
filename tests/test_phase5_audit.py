@@ -21,13 +21,8 @@ async def pg_pool(require_database_url):
     pool = await asyncpg.create_pool(require_database_url, min_size=1, max_size=8)
     async with pool.acquire() as conn:
         await apply_schema(conn)
-        await conn.execute(
-            """
-            TRUNCATE metric_samples, metric_counters, schedule_runs,
-                     work_queue, webhook_outbox, idempotency_keys,
-                     events, assets, jobs CASCADE
-            """
-        )
+        from tests.conftest import truncate_app_tables
+        await truncate_app_tables(conn)
     dbmod._pool = pool
     yield pool
     await pool.close()

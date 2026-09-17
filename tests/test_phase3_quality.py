@@ -26,9 +26,8 @@ async def pg_pool(require_database_url):
     pool = await asyncpg.create_pool(require_database_url, min_size=1, max_size=5)
     async with pool.acquire() as conn:
         await _apply_schema(conn)
-        await conn.execute(
-            "TRUNCATE work_queue, webhook_outbox, idempotency_keys, events, assets, jobs CASCADE"
-        )
+        from tests.conftest import truncate_app_tables
+        await truncate_app_tables(conn)
     dbmod._pool = pool
     yield pool
     await pool.close()
@@ -78,12 +77,17 @@ def test_scriptgen_horizontal_paid_only_when_flagged():
 
 
 def test_state_machine_blocks_staged_to_delivered():
-    from app.state_machine import TRANSITIONS
-    assert "delivered" not in TRANSITIONS["staged"]
-    assert "delivered" not in TRANSITIONS["rendered"]
-    assert "approved" in TRANSITIONS["staged"]
-    assert "delivered" in TRANSITIONS["approved"]
-    assert "staged" in TRANSITIONS["rendered"]
+    from app.state_machine import LEGACY_TRANSITIONS, TRANSITIONS
+    # Legacy graph (Phase 1–5 dual-mode)
+    assert "delivered" not in LEGACY_TRANSITIONS["staged"]
+    assert "delivered" not in LEGACY_TRANSITIONS["rendered"]
+    assert "approved" in LEGACY_TRANSITIONS["staged"]
+    assert "delivered" in LEGACY_TRANSITIONS["approved"]
+    assert "staged" in LEGACY_TRANSITIONS["rendered"]
+    # Canonical SoT: review → approved → published (no skip-approve publish)
+    assert "published" not in TRANSITIONS["review"]
+    assert "published" in TRANSITIONS["approved"]
+    assert "review" in TRANSITIONS["render_done"]
 
 
 @pytest.mark.asyncio

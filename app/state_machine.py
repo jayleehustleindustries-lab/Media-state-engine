@@ -123,11 +123,17 @@ async def _legacy_advance(conn, job_id: UUID, to_status: str, payload: dict[str,
             'VALUES($1,$2,$3,$4,$5,$6::jsonb)',
             job_id, current, to_status, 'system', None, json.dumps(payload),
         )
-    else:
+    has_events = await conn.fetchval(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema='public' AND table_name='events'"
+    )
+    if has_events:
         await conn.execute(
             'INSERT INTO events(job_id, from_status, to_status, payload) VALUES($1,$2,$3,$4::jsonb)',
             job_id, current, to_status, json.dumps(payload),
         )
+    elif not has_job_events:
+        raise RuntimeError('neither job_events nor events table present')
     return await conn.fetchrow(
         'UPDATE jobs SET status=$2, updated_at=now() WHERE id=$1 RETURNING *',
         job_id, to_status,

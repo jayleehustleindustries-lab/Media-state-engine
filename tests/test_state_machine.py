@@ -23,6 +23,8 @@ class FakeConn:
             return False
         if "table_name='job_events'" in sql:
             return None
+        if "table_name='events'" in sql:
+            return 1
         return None
 
     async def execute(self, sql, *args):
