@@ -1,7 +1,7 @@
 from uuid import UUID
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from ..models import JobCreate, AdvanceRequest, AssetCreate, AudioWebhook, RenderWebhook
-from ..services import jobs, pipeline
+from ..services import jobs, pipeline, heygen
 from ..state_machine import IllegalTransition
 
 router = APIRouter()
@@ -40,6 +40,12 @@ async def render(job_id: UUID):
     except LookupError as exc: raise HTTPException(404, str(exc))
     except (IllegalTransition, RuntimeError) as exc: raise HTTPException(409, str(exc))
 
+@router.post('/jobs/{job_id}/generate-avatar')
+async def avatar(job_id: UUID):
+    try: return await pipeline.generate_avatar(job_id)
+    except LookupError as exc: raise HTTPException(404, str(exc))
+    except (IllegalTransition, RuntimeError, heygen.HeyGenError) as exc: raise HTTPException(409, str(exc))
+
 @router.post('/webhooks/elevenlabs')
 async def elevenlabs_webhook(request: AudioWebhook):
     return await jobs.add_asset(request.job_id, 'audio', request.url, request.storage_path, request.meta)
@@ -47,3 +53,17 @@ async def elevenlabs_webhook(request: AudioWebhook):
 @router.post('/webhooks/remotion')
 async def remotion_webhook(request: RenderWebhook):
     return await jobs.add_asset(request.job_id, 'final', request.url, request.storage_path, request.meta)
+
+@router.post('/webhooks/heygen')
+async def heygen_webhook(request: Request):
+    raw_body = await request.body()
+    try:
+        payload = heygen.parse_webhook(raw_body, request.headers.get('signature'))
+        event_type, video_id, event_data = heygen.webhook_video(payload)
+        return await pipeline.complete_heygen_webhook(event_type, video_id, event_data)
+    except heygen.InvalidHeyGenSignature as exc:
+        raise HTTPException(401, str(exc))
+    except LookupError as exc:
+        raise HTTPException(404, str(exc))
+    except heygen.HeyGenError as exc:
+        raise HTTPException(400, str(exc))

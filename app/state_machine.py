@@ -4,7 +4,7 @@ from uuid import UUID
 
 TRANSITIONS = {
     'pending': {'script_ready', 'failed'},
-    'script_ready': {'audio_generating', 'failed'},
+    'script_ready': {'audio_generating', 'rendering', 'failed'},
     'audio_generating': {'audio_ready', 'failed'},
     'audio_ready': {'rendering', 'failed'},
     'rendering': {'rendered', 'failed'},
