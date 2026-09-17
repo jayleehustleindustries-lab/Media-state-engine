@@ -128,34 +128,32 @@ async def mark_failure(conn, outbox_id: int, error: str, attempts: int, max_atte
 
 
 async def _maybe_advance_delivered(conn, job_id: UUID) -> bool:
-    """If auto-deliver is on and job is rendered, advance to delivered after outbox success."""
-    if not settings.auto_deliver_on_outbox_success:
-        return False
-    from ..state_machine import advance, IllegalTransition
+    """Phase 3: REFUSE to auto-advance jobs to delivered / public post from outbox.
 
-    job = await conn.fetchrow("SELECT id, status FROM jobs WHERE id=$1 FOR UPDATE", job_id)
-    if not job or job["status"] != "rendered":
-        return False
-    try:
-        await advance(conn, job_id, "delivered", {"via": "outbox_delivery"})
-        return True
-    except IllegalTransition:
-        return False
+    Outbox success only means the *internal* review webhook was POSTed.
+    Public platform distribution requires explicit approve (staged → approved).
+    ``AUTO_DELIVER_ON_OUTBOX_SUCCESS`` is ignored for publish — kept as a no-op
+    so misconfigured envs cannot burn a silent publish path.
+    """
+    # Hard push-back: never auto-publish / auto-deliver from outbox.
+    _ = (conn, job_id, settings.auto_deliver_on_outbox_success)
+    return False
 
 
 async def process_due(conn, *, limit: int = 20, deliver=_deliver_once) -> dict[str, int]:
-    """Claim due rows and attempt delivery. Caller must hold a connection/transaction context carefully.
+    """Claim due rows and attempt delivery.
 
-    Each delivery is attempted outside a long-held lock: we claim in a short
-    transaction, deliver, then finalize in a new transaction via the same conn
-    if the caller uses autocommit-style acquires. Here we finalize in-place
-    after each attempt within the same connection.
-
-    On successful delivery (and when AUTO_DELIVER_ON_OUTBOX_SUCCESS is true),
-    advances the job rendered → delivered to complete the happy path.
+    On successful outbox delivery we do NOT advance the job to ``delivered``.
+    That transition is reserved for the post-approve distribute path.
     """
     claimed = await claim_due(conn, limit=limit)
-    stats = {"claimed": len(claimed), "delivered": 0, "retried": 0, "dead": 0, "jobs_marked_delivered": 0}
+    stats = {
+        "claimed": len(claimed),
+        "delivered": 0,
+        "retried": 0,
+        "dead": 0,
+        "jobs_marked_delivered": 0,
+    }
     for row in claimed:
         payload = row["payload"]
         if isinstance(payload, str):
@@ -165,6 +163,7 @@ async def process_due(conn, *, limit: int = 20, deliver=_deliver_once) -> dict[s
             await deliver(row["destination_url"], dict(payload))
             await mark_delivered(conn, row["id"])
             stats["delivered"] += 1
+            # Intentionally never marks job delivered (Phase 3 approval gate)
             if await _maybe_advance_delivered(conn, row["job_id"]):
                 stats["jobs_marked_delivered"] += 1
         except Exception as exc:  # noqa: BLE001 — outbox must never crash the worker

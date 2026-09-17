@@ -68,3 +68,20 @@ python -m app.worker
 - Outbox success can auto-advance `rendered → delivered`
 
 See `PHASE2_REPORT.md` for queue choice, env vars, and stress-test notes.
+
+## Phase 3 — content quality + approval gate
+
+Short-form script generation stores structured `hook` / `body` / `cta` / duration on the job, stages TikTok/Reels/Shorts captions+overlays, and keeps **9:16** as the only default HeyGen render. Horizontal **16:9** is opt-in and does not burn a second HeyGen credit unless `HEYGEN_ALLOW_DUAL_FORMAT=true`.
+
+After render, jobs land in **`staged`** (awaiting human approval). Nothing auto-publishes.
+
+```bash
+# Approve (API)
+curl -X POST "$HOST/jobs/$ID/approve" -H "Authorization: Bearer $MEDIA_ENGINE_API_KEY" \
+  -H 'content-type: application/json' -d '{"approved_by":"jordan"}'
+
+# Approve (CLI)
+python -m app.cli approve <job_id> --by jordan
+```
+
+Distribute in Phase 3 is a **stub** (`approved → delivered`, `public_post=false`). Real platform wire is Phase 4. See `PHASE3_REPORT.md`.

@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     heygen_webhook_secret: str = ""
     # Explicit callback override; else PUBLIC_BASE_URL + /webhooks/heygen
     heygen_callback_url: str = ""
+    # Cost guardrail: second HeyGen render for 16:9 ONLY when this is true AND job opts in
+    heygen_allow_dual_format: bool = False
 
     remotion_render_url: str = ""
     remotion_webhook_secret: str = ""
@@ -48,8 +50,10 @@ class Settings(BaseSettings):
     worker_batch_size: int = 5
     worker_max_attempts: int = 5
     worker_reconcile_interval_seconds: float = 60.0
-    # After outbound delivery succeeds, advance rendered → delivered
-    auto_deliver_on_outbox_success: bool = True
+    # Phase 3: NEVER auto-advance to delivered / public post from outbox.
+    # Kept for backward-compat reads; ignored for public publish. Staging uses
+    # rendered → staged inside the render completion path instead.
+    auto_deliver_on_outbox_success: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

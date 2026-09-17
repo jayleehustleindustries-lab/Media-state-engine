@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from ..auth import require_api_key
 from ..config import settings
-from ..models import JobCreate, AdvanceRequest, AssetCreate, AudioWebhook, RenderWebhook
+from ..models import JobCreate, AdvanceRequest, AssetCreate, AudioWebhook, RenderWebhook, ApproveRequest
 from ..services import jobs, pipeline, heygen, outbox, queue
 from ..state_machine import IllegalTransition
 
@@ -16,7 +16,19 @@ router = APIRouter()
 
 
 def out(row):
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    for k in ('script', 'meta'):
+        if k in d and hasattr(d[k], 'keys') is False and isinstance(d[k], str):
+            import json
+            d[k] = json.loads(d[k])
+    for k, v in list(d.items()):
+        if hasattr(v, 'isoformat'):
+            d[k] = v.isoformat()
+        elif k in ('id',) and v is not None:
+            d[k] = str(v)
+    return d
 
 
 def _queued(work: dict) -> dict:
@@ -34,6 +46,7 @@ def _queued(work: dict) -> dict:
 class AvatarEnqueueBody(BaseModel):
     avatar_id: str | None = None
     voice_id: str | None = None
+    include_horizontal: bool | None = None
 
 
 def _verify_inbound_hmac(raw_body: bytes, signature: str | None, secret: str, name: str) -> None:
@@ -52,7 +65,19 @@ def _verify_inbound_hmac(raw_body: bytes, signature: str | None, secret: str, na
 
 @router.post('/jobs', status_code=201, dependencies=[Depends(require_api_key)])
 async def create(request: JobCreate):
-    return out(await jobs.create_job(request.script_text))
+    try:
+        row = await jobs.create_job(
+            request.script_text,
+            topic=request.topic,
+            duration_target_seconds=request.duration_target_seconds,
+            cta=request.cta,
+            include_horizontal=request.include_horizontal,
+            platforms=request.platforms,
+            auto_script_ready=request.auto_script_ready,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return out(row)
 
 
 @router.get('/jobs/{job_id}', dependencies=[Depends(require_api_key)])
@@ -66,7 +91,7 @@ async def get(job_id: UUID):
 
 @router.get('/jobs/{job_id}/detail', dependencies=[Depends(require_api_key)])
 async def detail(job_id: UUID):
-    """Full job detail: assets, events, status history, work queue, outbox."""
+    """Full job detail: assets, events, status history, work queue, outbox, script, captions."""
     data = await jobs.get_job_detail(job_id)
     if not data:
         raise HTTPException(404, 'job not found')
@@ -87,7 +112,28 @@ async def advance_endpoint(job_id: UUID, request: AdvanceRequest):
         return out(await jobs.advance_job(job_id, request.to_status, request.payload))
     except LookupError as exc:
         raise HTTPException(404, str(exc))
-    except IllegalTransition as exc:
+    except (IllegalTransition, ValueError) as exc:
+        raise HTTPException(409, str(exc))
+
+
+@router.post('/jobs/{job_id}/approve', dependencies=[Depends(require_api_key)])
+async def approve_endpoint(job_id: UUID, body: ApproveRequest | None = None):
+    """Explicit human approval gate. Required before any distribution.
+
+    Flips staged → approved and may enqueue the Phase-3 distribute stub.
+    Does NOT publish to TikTok / Reels / Shorts.
+    """
+    body = body or ApproveRequest()
+    try:
+        return await jobs.approve_job(
+            job_id,
+            approved_by=body.approved_by,
+            enqueue_distribute=body.enqueue_distribute,
+            note=body.note,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc))
+    except (IllegalTransition, ValueError) as exc:
         raise HTTPException(409, str(exc))
 
 
@@ -128,6 +174,8 @@ async def avatar(job_id: UUID, body: AvatarEnqueueBody | None = None):
             payload['avatar_id'] = body.avatar_id
         if body.voice_id:
             payload['voice_id'] = body.voice_id
+        if body.include_horizontal is not None:
+            payload['include_horizontal'] = body.include_horizontal
     try:
         work = await queue.enqueue_step(job_id, 'generate_avatar', payload)
     except LookupError as exc:

@@ -3,7 +3,14 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   script_text text NOT NULL,
-  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','script_ready','audio_generating','audio_ready','rendering','rendered','delivered','failed')),
+  script jsonb NOT NULL DEFAULT '{}'::jsonb,
+  meta jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN (
+    'pending','script_ready','audio_generating','audio_ready',
+    'rendering','rendered','staged','approved','delivered','failed'
+  )),
+  approved_at timestamptz,
+  approved_by text,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -11,7 +18,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE TABLE IF NOT EXISTS assets (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-  kind text NOT NULL CHECK (kind IN ('audio','video','final')),
+  kind text NOT NULL CHECK (kind IN ('audio','video','final','video_h','final_h')),
   url text,
   storage_path text,
   meta jsonb NOT NULL DEFAULT '{}',
@@ -66,7 +73,7 @@ CREATE TABLE IF NOT EXISTS work_queue (
   id bigserial PRIMARY KEY,
   job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   step text NOT NULL
-    CHECK (step IN ('generate_audio','generate_avatar','render','reconcile','flush_outbox')),
+    CHECK (step IN ('generate_audio','generate_avatar','render','reconcile','flush_outbox','distribute')),
   payload jsonb NOT NULL DEFAULT '{}',
   status text NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','running','done','failed','dead')),

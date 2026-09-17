@@ -12,8 +12,8 @@ pytestmark = pytest.mark.postgres
 
 
 async def _apply_schema(conn):
-    schema = Path(__file__).resolve().parents[1] / 'schema.sql'
-    await conn.execute(schema.read_text())
+    from tests.conftest import apply_schema
+    await apply_schema(conn)
 
 
 @pytest.fixture

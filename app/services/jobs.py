@@ -4,9 +4,16 @@ from typing import Any
 from ..db import transaction
 from ..state_machine import advance
 from ..config import settings
+from . import scriptgen
 
 
-def _serialize_row(row) -> dict:
+def _parse_json_field(v):
+    if isinstance(v, str):
+        return json.loads(v)
+    return v
+
+
+def _serialize_row(row) -> dict | None:
     if row is None:
         return None
     out = dict(row)
@@ -15,18 +22,53 @@ def _serialize_row(row) -> dict:
             out[k] = v.isoformat()
         elif k in ("id", "job_id") and v is not None:
             out[k] = str(v)
-        elif k == "meta" and isinstance(v, str):
-            out[k] = json.loads(v)
-        elif k == "payload" and isinstance(v, str):
-            out[k] = json.loads(v)
-        elif k == "result" and isinstance(v, str):
+        elif k in ("meta", "script", "payload", "result") and isinstance(v, str):
             out[k] = json.loads(v)
     return out
 
 
-async def create_job(script_text: str):
+async def create_job(
+    script_text: str | None = None,
+    *,
+    topic: str | None = None,
+    duration_target_seconds: int = 30,
+    cta: str | None = None,
+    include_horizontal: bool = False,
+    platforms: list[str] | None = None,
+    auto_script_ready: bool = True,
+    heygen_dual_paid: bool | None = None,
+):
+    """Create a job with structured script + platform caption staging fields."""
+    dual = bool(settings.heygen_allow_dual_format) if heygen_dual_paid is None else bool(heygen_dual_paid)
+    # Cost guardrail: paid dual only when env allow-flag AND caller asked for horizontal
+    paid_horizontal = bool(include_horizontal) and bool(settings.heygen_allow_dual_format) and dual
+    full_text, script, meta = scriptgen.compose_script(
+        script_text=script_text,
+        topic=topic,
+        duration_target_seconds=duration_target_seconds,
+        cta=cta,
+        include_horizontal=include_horizontal,
+        heygen_dual_paid=paid_horizontal,
+        platforms=platforms,
+    )
     async with transaction() as conn:
-        return await conn.fetchrow('INSERT INTO jobs(script_text) VALUES($1) RETURNING *', script_text)
+        row = await conn.fetchrow(
+            """
+            INSERT INTO jobs(script_text, script, meta, status)
+            VALUES($1, $2::jsonb, $3::jsonb, 'pending')
+            RETURNING *
+            """,
+            full_text,
+            json.dumps(script),
+            json.dumps(meta),
+        )
+        if auto_script_ready:
+            row = await advance(conn, row['id'], 'script_ready', {
+                'script': script,
+                'formats': meta.get('formats'),
+                'platform_captions_staged': True,
+            })
+        return row
 
 
 async def get_job(job_id: UUID):
@@ -62,9 +104,14 @@ async def get_job_detail(job_id: UUID) -> dict | None:
         }
         for e in events
     ]
+    job_out = _serialize_row(job)
     return {
-        'job': _serialize_row(job),
+        'job': job_out,
         'status': job['status'],
+        'script': _parse_json_field(job['script']) if 'script' in job.keys() else {},
+        'meta': _parse_json_field(job['meta']) if 'meta' in job.keys() else {},
+        'awaiting_approval': job['status'] == 'staged',
+        'approved': job['status'] in ('approved', 'delivered'),
         'assets': [_serialize_row(a) for a in assets],
         'events': [_serialize_row(e) for e in events],
         'status_history': status_history,
@@ -74,8 +121,79 @@ async def get_job_detail(job_id: UUID) -> dict | None:
 
 
 async def advance_job(job_id: UUID, to_status: str, payload: dict[str, Any]):
+    # Hard gate: never allow skipping approval into delivered
+    if to_status == 'delivered':
+        async with transaction() as conn:
+            job = await conn.fetchrow('SELECT status FROM jobs WHERE id=$1', job_id)
+            if not job:
+                raise LookupError('job not found')
+            if job['status'] != 'approved':
+                raise ValueError(
+                    f'cannot deliver from {job["status"]}: explicit approve required '
+                    f'(status must be approved before delivered / any public post)'
+                )
     async with transaction() as conn:
         return await advance(conn, job_id, to_status, payload)
+
+
+async def approve_job(
+    job_id: UUID,
+    *,
+    approved_by: str | None = None,
+    enqueue_distribute: bool = True,
+    note: str | None = None,
+) -> dict:
+    """Flip staged → approved. Optionally enqueue distribute stub (no public post)."""
+    from . import queue
+
+    async with transaction() as conn:
+        job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', job_id)
+        if not job:
+            raise LookupError('job not found')
+        if job['status'] != 'staged':
+            raise ValueError(
+                f'job status is {job["status"]}, expected staged '
+                f'(nothing auto-publishes; approve only from staged)'
+            )
+        who = (approved_by or 'operator').strip() or 'operator'
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET approved_at = now(),
+                approved_by = $2,
+                meta = COALESCE(meta, '{}'::jsonb) || $3::jsonb,
+                updated_at = now()
+            WHERE id = $1
+            """,
+            job_id,
+            who,
+            json.dumps({
+                'awaiting_approval': False,
+                'approval_note': note,
+                'auto_publish': False,
+            }),
+        )
+        row = await advance(conn, job_id, 'approved', {
+            'approved_by': who,
+            'note': note,
+            'via': 'approve_gate',
+        })
+        work = None
+        if enqueue_distribute:
+            work = await queue.enqueue(conn, job_id, 'distribute', {
+                'stub': True,
+                'approved_by': who,
+                'note': 'Phase 3 distribute stub — no public platform post',
+            })
+    return {
+        'job': _serialize_row(row),
+        'status': 'approved',
+        'approved_by': who,
+        'distribute_enqueued': work is not None,
+        'work_id': int(work['id']) if work else None,
+        'public_post': False,
+        'note': 'Approved for distribution stub only. Phase 4 wires real platform publish.',
+    }
 
 
 async def add_asset(job_id: UUID, kind: str, url: str | None, storage_path: str | None, meta: dict[str, Any]):

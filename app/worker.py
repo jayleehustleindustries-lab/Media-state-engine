@@ -58,6 +58,7 @@ async def process_work_item(item: dict[str, Any]) -> None:
                 job_id,
                 avatar_id=payload.get("avatar_id"),
                 voice_id=payload.get("voice_id"),
+                include_horizontal=payload.get("include_horizontal"),
             )
         elif step == "render":
             result = await pipeline.render(job_id)
@@ -65,6 +66,9 @@ async def process_work_item(item: dict[str, Any]) -> None:
             result = await pipeline.reconcile_job(job_id)
         elif step == "flush_outbox":
             result = await outbox.flush_outbox(limit=int(payload.get("limit", 50)))
+        elif step == "distribute":
+            # Phase 3 stub — refuses unless job is approved; no public platform APIs
+            result = await pipeline.distribute_stub(job_id)
         else:
             raise ValueError(f"unknown step: {step}")
 

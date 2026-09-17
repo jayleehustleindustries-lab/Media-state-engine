@@ -36,3 +36,26 @@ async def test_illegal_transition_has_zero_events():
     with pytest.raises(IllegalTransition):
         await advance(conn, conn.job['id'], 'rendered', {})
     assert conn.events == []
+
+
+@pytest.mark.asyncio
+async def test_rendered_to_staged_allowed():
+    conn = FakeConn(status='rendered')
+    result = await advance(conn, conn.job['id'], 'staged', {})
+    assert result['status'] == 'staged'
+
+
+@pytest.mark.asyncio
+async def test_staged_cannot_skip_to_delivered():
+    conn = FakeConn(status='staged')
+    with pytest.raises(IllegalTransition):
+        await advance(conn, conn.job['id'], 'delivered', {})
+    assert conn.events == []
+
+
+@pytest.mark.asyncio
+async def test_approve_then_deliver():
+    conn = FakeConn(status='staged')
+    await advance(conn, conn.job['id'], 'approved', {})
+    result = await advance(conn, conn.job['id'], 'delivered', {})
+    assert result['status'] == 'delivered'

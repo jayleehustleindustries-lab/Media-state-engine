@@ -12,8 +12,8 @@ pytestmark = pytest.mark.postgres
 
 
 async def _apply_schema(conn):
-    schema = Path(__file__).resolve().parents[1] / 'schema.sql'
-    await conn.execute(schema.read_text())
+    from tests.conftest import apply_schema
+    await apply_schema(conn)
 
 
 @pytest.fixture
@@ -82,16 +82,23 @@ async def test_heygen_success_promotes_final(pg_pool):
         'vid_2',
         {'video_id': 'vid_2', 'video_url': 'https://cdn/final.mp4'},
     )
-    assert result['status'] == 'rendered'
+    assert result['status'] == 'staged'
     assert result['kind'] == 'final'
+    assert result.get('awaiting_approval') is True
 
     async with pg_pool.acquire() as conn:
         final = await conn.fetchrow("SELECT * FROM assets WHERE job_id=$1 AND kind='final'", job_id)
         video = await conn.fetchrow("SELECT * FROM assets WHERE job_id=$1 AND kind='video'", job_id)
         job = await conn.fetchrow('SELECT status FROM jobs WHERE id=$1', job_id)
+        events = await conn.fetch(
+            "SELECT from_status, to_status FROM events WHERE job_id=$1 ORDER BY id", job_id
+        )
     assert final['url'] == 'https://cdn/final.mp4'
     assert video is not None
-    assert job['status'] == 'rendered'
+    assert job['status'] == 'staged'
+    assert [('rendering', 'rendered'), ('rendered', 'staged')] == [
+        (e['from_status'], e['to_status']) for e in events
+    ]
 
 
 @pytest.mark.asyncio

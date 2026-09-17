@@ -17,6 +17,7 @@ STEPS = frozenset({
     "render",
     "reconcile",
     "flush_outbox",
+    "distribute",
 })
 
 

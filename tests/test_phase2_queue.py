@@ -11,8 +11,8 @@ pytestmark = pytest.mark.postgres
 
 
 async def _apply_schema(conn):
-    schema = Path(__file__).resolve().parents[1] / "schema.sql"
-    await conn.execute(schema.read_text())
+    from tests.conftest import apply_schema
+    await apply_schema(conn)
 
 
 @pytest.fixture
@@ -213,36 +213,38 @@ async def test_api_generate_audio_returns_202(pg_pool):
 
 
 @pytest.mark.asyncio
-async def test_outbox_success_advances_to_delivered(pg_pool, monkeypatch):
+async def test_outbox_success_does_not_auto_deliver(pg_pool, monkeypatch):
+    """Phase 3: outbox success must NOT advance job to delivered (approval gate)."""
     from app.services import outbox
     from app.db import transaction
     from app.config import settings
 
+    # Even if misconfigured True, Phase 3 hard-blocks auto-deliver
     monkeypatch.setattr(settings, "auto_deliver_on_outbox_success", True)
     monkeypatch.setattr(settings, "webhook_url", "http://example.test/hook")
     monkeypatch.setattr(settings, "webhook_secret", "sekrit")
 
     async with pg_pool.acquire() as conn:
         job = await conn.fetchrow(
-            "INSERT INTO jobs(script_text, status) VALUES('script', 'rendered') RETURNING *"
+            "INSERT INTO jobs(script_text, status) VALUES('script', 'staged') RETURNING *"
         )
         job_id = job["id"]
 
     async with transaction() as conn:
-        await outbox.enqueue(conn, job_id, {"status": "rendered", "job_id": str(job_id)})
+        await outbox.enqueue(conn, job_id, {"status": "staged", "job_id": str(job_id)})
 
     async def ok_deliver(url, payload):
         assert url == "http://example.test/hook"
-        assert payload["status"] == "rendered"
+        assert payload["status"] == "staged"
 
     async with transaction() as conn:
         stats = await outbox.process_due(conn, deliver=ok_deliver)
 
     assert stats["delivered"] == 1
-    assert stats["jobs_marked_delivered"] == 1
+    assert stats["jobs_marked_delivered"] == 0
     async with pg_pool.acquire() as conn:
         job = await conn.fetchrow("SELECT status FROM jobs WHERE id=$1", job_id)
-    assert job["status"] == "delivered"
+    assert job["status"] == "staged"
 
 
 @pytest.mark.asyncio

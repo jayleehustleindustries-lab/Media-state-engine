@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+
 import pytest
 
 # Ensure auth is configured for app-level tests unless a test overrides.
@@ -20,3 +22,15 @@ def require_database_url(database_url):
     if not database_url:
         pytest.skip("DATABASE_URL not set — skipping real Postgres tests")
     return database_url
+
+
+async def apply_schema(conn):
+    """Drop + recreate so Phase 3 columns/statuses are present in tests."""
+    await conn.execute(
+        """
+        DROP TABLE IF EXISTS work_queue, webhook_outbox, idempotency_keys,
+                             events, assets, jobs CASCADE
+        """
+    )
+    schema = Path(__file__).resolve().parents[1] / "schema.sql"
+    await conn.execute(schema.read_text())
