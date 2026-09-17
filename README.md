@@ -41,3 +41,10 @@ The suite covers event-before-status semantics, illegal transitions producing ze
 ## Deployment
 
 Railway can build from the included `Dockerfile` and use `railway.toml` for `/health` checks. Fly.io can use the same image. Run `schema.sql` once in Supabase before starting the service, then configure the variables in `.env.example`.
+
+
+## Phase 1 hardening
+
+Authenticated API access is required for job routes. Set `MEDIA_ENGINE_API_KEY` or `API_KEY` and send `Authorization: Bearer …` or `X-API-Key`. Health and `/webhooks/*` stay public; provider webhooks verify HMAC secrets (`HEYGEN_WEBHOOK_SECRET`, `ELEVENLABS_WEBHOOK_SECRET`, `REMOTION_WEBHOOK_SECRET`).
+
+Outbound delivery uses a durable `webhook_outbox` with exponential backoff and dead-letter after N attempts. Stuck HeyGen jobs can be reconciled with `POST /jobs/{id}/reconcile` or `POST /admin/reconcile-stuck`. See `PHASE1_REPORT.md`.
