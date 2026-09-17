@@ -85,3 +85,21 @@ python -m app.cli approve <job_id> --by jordan
 ```
 
 Distribute in Phase 3 is a **stub** (`approved → delivered`, `public_post=false`). Real platform wire is Phase 4. See `PHASE3_REPORT.md`.
+
+
+## Phase 4 — scheduling + distribution
+
+Daily cadence creates `script_ready` jobs (default 2–3/day). Nothing public-posts without approve.
+
+```bash
+# Cron / ops tick
+python -m app.cli schedule-tick
+python -m app.cli schedule-status
+
+# Or HTTP
+curl -X POST "$HOST/admin/scheduler/tick" -H "Authorization: Bearer $MEDIA_ENGINE_API_KEY" -H 'content-type: application/json' -d '{}'
+```
+
+**YouTube Shorts** is the wired distributor: live upload when `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` / `YOUTUBE_REFRESH_TOKEN` are set and a local final MP4 exists; otherwise staging files under `data/staging/{job_id}/`. TikTok, Reels, and manual Shorts remain documented-only.
+
+Metrics: `GET /metrics` or `GET /admin/metrics` (API key). See `PHASE4_REPORT.md`.

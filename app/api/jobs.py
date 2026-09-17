@@ -120,8 +120,8 @@ async def advance_endpoint(job_id: UUID, request: AdvanceRequest):
 async def approve_endpoint(job_id: UUID, body: ApproveRequest | None = None):
     """Explicit human approval gate. Required before any distribution.
 
-    Flips staged → approved and may enqueue the Phase-3 distribute stub.
-    Does NOT publish to TikTok / Reels / Shorts.
+    Flips staged → approved and may enqueue distribute.
+    YouTube may go live only when OAuth env is set; TikTok/Reels never auto-post.
     """
     body = body or ApproveRequest()
     try:
@@ -209,6 +209,41 @@ async def worker_tick(also_reconcile: bool = False):
     """Run one worker cycle in-process (tests / single-box ops without a separate process)."""
     from ..worker import tick
     return await tick(also_reconcile=also_reconcile)
+
+
+
+class SchedulerTickBody(BaseModel):
+    count: int | None = None
+    topics: list[str] | None = None
+    enqueue_avatar: bool | None = None
+    force: bool = False
+
+
+@router.post('/admin/scheduler/tick', dependencies=[Depends(require_api_key)])
+async def scheduler_tick(body: SchedulerTickBody | None = None):
+    """Create daily-cadence jobs (in-process scheduler tick). Never public-posts."""
+    from ..services import scheduler
+    body = body or SchedulerTickBody()
+    return await scheduler.tick(
+        count=body.count,
+        topics=body.topics,
+        enqueue_avatar=body.enqueue_avatar,
+        force=body.force,
+    )
+
+
+@router.get('/admin/scheduler/status', dependencies=[Depends(require_api_key)])
+async def scheduler_status():
+    from ..services import scheduler
+    return await scheduler.status()
+
+
+@router.get('/admin/metrics', dependencies=[Depends(require_api_key)])
+@router.get('/metrics', dependencies=[Depends(require_api_key)])
+async def metrics_endpoint():
+    """Pipeline counters, latency samples, cost estimates, jobs-by-status."""
+    from ..services import metrics
+    return await metrics.snapshot()
 
 
 @router.post('/webhooks/elevenlabs')

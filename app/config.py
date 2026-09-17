@@ -34,6 +34,8 @@ class Settings(BaseSettings):
 
     # Local asset storage (ElevenLabs audio bytes, etc.)
     asset_storage_dir: str = "data/assets"
+    # Staging packages for manual / pre-live distribute
+    distribute_staging_dir: str = "data/staging"
 
     # Outbox delivery
     webhook_outbox_max_attempts: int = 8
@@ -55,6 +57,22 @@ class Settings(BaseSettings):
     # rendered → staged inside the render completion path instead.
     auto_deliver_on_outbox_success: bool = False
 
+    # Phase 4 — daily cadence scheduler
+    schedule_posts_per_day: int = 3
+    schedule_timezone: str = "America/Los_Angeles"
+    schedule_topics: str = ""  # comma-separated or JSON list
+    schedule_duration_seconds: int = 30
+    schedule_platforms: str = "tiktok,reels,shorts"
+    # When true, schedule tick also enqueues generate_avatar (burns HeyGen when worker runs)
+    schedule_enqueue_avatar: bool = False
+
+    # Phase 4 — YouTube Shorts (OAuth). Empty = safe staging-only no-op.
+    youtube_client_id: str = ""
+    youtube_client_secret: str = ""
+    youtube_refresh_token: str = ""
+    # private | unlisted | public — default private so even live uploads are not public
+    youtube_privacy_status: str = "private"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -70,6 +88,19 @@ class Settings(BaseSettings):
         if base:
             return f"{base}/webhooks/heygen"
         return ""
+
+    @property
+    def schedule_platforms_list(self) -> list[str]:
+        raw = (self.schedule_platforms or "tiktok,reels,shorts").strip()
+        return [p.strip() for p in raw.split(",") if p.strip()] or ["tiktok", "reels", "shorts"]
+
+    @property
+    def youtube_configured(self) -> bool:
+        return bool(
+            self.youtube_client_id.strip()
+            and self.youtube_client_secret.strip()
+            and self.youtube_refresh_token.strip()
+        )
 
 
 settings = Settings()

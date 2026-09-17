@@ -25,10 +25,11 @@ def require_database_url(database_url):
 
 
 async def apply_schema(conn):
-    """Drop + recreate so Phase 3 columns/statuses are present in tests."""
+    """Drop + recreate so Phase 4 schema (schedule + metrics) are present in tests."""
     await conn.execute(
         """
-        DROP TABLE IF EXISTS work_queue, webhook_outbox, idempotency_keys,
+        DROP TABLE IF EXISTS metric_samples, metric_counters, schedule_runs,
+                             work_queue, webhook_outbox, idempotency_keys,
                              events, assets, jobs CASCADE
         """
     )

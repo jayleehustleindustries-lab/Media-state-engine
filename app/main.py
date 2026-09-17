@@ -12,7 +12,7 @@ async def lifespan(app):
     await close()
 
 
-app = FastAPI(title='Media State Engine', version='1.3.0', lifespan=lifespan)
+app = FastAPI(title='Media State Engine', version='1.4.0', lifespan=lifespan)
 app.add_middleware(ApiKeyMiddleware)
 app.include_router(jobs_router)
 

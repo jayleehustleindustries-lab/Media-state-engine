@@ -30,6 +30,19 @@ async def _fail_step(conn, job_id: UUID, key: str, payload: dict):
     await jobs.clear_key(conn, key)
     try:
         await advance(conn, job_id, 'failed', payload)
+        # Best-effort counter (same connection / after advance)
+        try:
+            await conn.execute(
+                """
+                INSERT INTO metric_counters(name, value, labels, updated_at)
+                VALUES('jobs_failed', 1, $1::jsonb, now())
+                ON CONFLICT (name) DO UPDATE
+                  SET value = metric_counters.value + 1, updated_at = now()
+                """,
+                json.dumps({'step': (payload or {}).get('step')}),
+            )
+        except Exception:
+            pass
     except IllegalTransition:
         # Already terminal or unexpected — still clear key above.
         job = await conn.fetchrow('SELECT status FROM jobs WHERE id=$1', job_id)
@@ -119,6 +132,13 @@ async def render(job_id: UUID):
         response = {'asset_id': str(asset['id']), 'status': 'rendered', 'kind': 'final'}
         response = await _stage_for_approval(conn, job_id, response)
     await outbox.flush_outbox(limit=10)
+    try:
+        from . import metrics
+        await metrics.incr('jobs_rendered')
+        await metrics.incr('jobs_staged')
+        await metrics.record_job_cost(job_id, metrics.estimate_cost(heygen_paid_calls=0, used_remotion=True))
+    except Exception:
+        pass
     return response
 
 
@@ -463,15 +483,30 @@ async def complete_heygen_webhook(event_type: str, video_id: str, event_data: di
         # Phase 3 gate: stage for human approval — do NOT auto-publish / deliver
         response = await _stage_for_approval(conn, job['id'], response)
     await outbox.flush_outbox(limit=10)
+    try:
+        from . import metrics
+        await metrics.incr('jobs_rendered', labels={'provider': 'heygen'})
+        await metrics.incr('jobs_staged', labels={'provider': 'heygen'})
+        await metrics.record_job_cost(
+            job['id'],
+            metrics.estimate_cost(heygen_paid_calls=1, used_remotion=False),
+        )
+    except Exception:
+        pass
     return response
 
 
-async def distribute_stub(job_id: UUID) -> dict:
-    """Phase 3 distribution stub.
+async def distribute(job_id: UUID) -> dict:
+    """Phase 4 distribution — approval-gated.
 
     Advances approved → delivered ONLY after explicit approve.
-    Does NOT call TikTok/Reels/Shorts APIs. Phase 4 wires real publish.
+    Always writes staging package. Calls YouTube when OAuth env is set and a
+    local video file exists; otherwise staging-only (public_post=false).
+    TikTok / Reels remain documented-only (captions staged, never auto-posted).
     """
+    from . import metrics
+    from .distribute import run_distribution
+
     async with transaction() as conn:
         job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', job_id)
         if not job:
@@ -481,37 +516,89 @@ async def distribute_stub(job_id: UUID) -> dict:
                 f'refuse distribute: job status is {job["status"]}, expected approved '
                 f'(nothing auto-publishes without explicit approve)'
             )
-        meta = _job_meta(job)
-        platforms = list((meta.get('platform_captions') or {}).keys()) or ['tiktok', 'reels', 'shorts']
-        await advance(conn, job_id, 'delivered', {
-            'via': 'distribute_stub',
-            'stub': True,
-            'platforms': platforms,
-            'public_post': False,
-            'note': 'Phase 3 stub — platforms NOT contacted',
-        })
-        await conn.execute(
-            """
-            UPDATE jobs SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb, updated_at=now()
-            WHERE id=$1
-            """,
+        final = await conn.fetchrow(
+            "SELECT * FROM assets WHERE job_id=$1 AND kind='final'",
             job_id,
-            json.dumps({
-                'distribution': {
-                    'stub': True,
-                    'platforms': platforms,
-                    'public_post': False,
-                    'status': 'stub_delivered',
-                }
-            }),
         )
+        job_dict = dict(job)
+        final_dict = dict(final) if final else None
+
+    dist = await run_distribution(job_id=job_id, job_row=job_dict, final_asset=final_dict)
+
+    # Hard fail live upload errors so work_queue can retry — but staging-only is success
+    live_failures = [
+        r for r in dist.get('results') or []
+        if r.get('mode') == 'failed'
+    ]
+    # If youtube was configured and failed with no staging fallback desired for retry:
+    # We still advance to delivered for staging_only; for hard live failures with
+    # configured credentials, raise so worker retries.
+    from ..config import settings as _settings
+    if live_failures and _settings.youtube_configured:
+        # Record failure metrics but do not mark delivered / public_post
+        await metrics.incr('jobs_failed', labels={'step': 'distribute'})
+        for r in live_failures:
+            if r.get('latency_ms') is not None:
+                await metrics.observe('youtube', float(r['latency_ms']), labels={'outcome': 'failed'})
+        raise RuntimeError(
+            'distribute live failure: ' + '; '.join(
+                (r.get('error') or r.get('platform') or 'unknown') for r in live_failures
+            )
+        )
+
+    public_post = bool(dist.get('public_post'))
+    async with transaction() as conn:
+        # Refresh captions published flags + distribution meta
+        meta = _job_meta(await conn.fetchrow('SELECT meta FROM jobs WHERE id=$1', job_id))
+        meta['platform_captions'] = dist.get('platform_captions') or meta.get('platform_captions') or {}
+        meta['distribution'] = {
+            'mode': dist.get('mode'),
+            'public_post': public_post,
+            'staging_path': dist.get('staging_path'),
+            'results': dist.get('results'),
+            'documented_only': dist.get('documented_only'),
+            'status': 'delivered',
+        }
+        await conn.execute(
+            'UPDATE jobs SET meta=$2::jsonb, updated_at=now() WHERE id=$1',
+            job_id, json.dumps(meta),
+        )
+        await advance(conn, job_id, 'delivered', {
+            'via': 'distribute',
+            'mode': dist.get('mode'),
+            'public_post': public_post,
+            'staging_path': dist.get('staging_path'),
+            'platforms': list((dist.get('platform_captions') or {}).keys()),
+        })
+
+    # Metrics
+    await metrics.incr('jobs_delivered', labels={'mode': dist.get('mode') or 'unknown'})
+    if public_post or dist.get('mode') == 'live':
+        await metrics.incr('jobs_distributed_live')
+    else:
+        await metrics.incr('jobs_distributed_staging')
+    for r in dist.get('results') or []:
+        if r.get('latency_ms') is not None:
+            await metrics.observe(
+                r.get('platform') or 'provider',
+                float(r['latency_ms']),
+                labels={'mode': r.get('mode'), 'outcome': 'ok' if r.get('mode') == 'live' else r.get('mode')},
+            )
+
     return {
         'job_id': str(job_id),
         'status': 'delivered',
-        'stub': True,
-        'public_post': False,
-        'platforms': platforms,
+        'public_post': public_post,
+        'mode': dist.get('mode'),
+        'staging_path': dist.get('staging_path'),
+        'results': dist.get('results'),
+        'stub': False,
     }
+
+
+async def distribute_stub(job_id: UUID) -> dict:
+    """Backward-compatible alias — Phase 4 real distribute (staging-safe)."""
+    return await distribute(job_id)
 
 
 async def reconcile_job(job_id: UUID) -> dict:

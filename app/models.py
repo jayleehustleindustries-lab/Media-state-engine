@@ -57,7 +57,7 @@ class ApproveRequest(BaseModel):
     approved_by: str | None = Field(default=None, description='Operator id or name')
     enqueue_distribute: bool = Field(
         default=True,
-        description='Enqueue Phase-3 distribute stub after approve (does not public-post)',
+        description='Enqueue distribute after approve (YouTube live only with OAuth; else staging)',
     )
     note: str | None = None
 

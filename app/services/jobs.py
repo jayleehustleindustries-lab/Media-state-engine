@@ -68,7 +68,13 @@ async def create_job(
                 'formats': meta.get('formats'),
                 'platform_captions_staged': True,
             })
-        return row
+    # metrics outside txn
+    from . import metrics as metrics_mod
+    try:
+        await metrics_mod.incr('jobs_created', labels={'source': 'api'})
+    except Exception:
+        pass
+    return row
 
 
 async def get_job(job_id: UUID):
@@ -181,9 +187,8 @@ async def approve_job(
         work = None
         if enqueue_distribute:
             work = await queue.enqueue(conn, job_id, 'distribute', {
-                'stub': True,
                 'approved_by': who,
-                'note': 'Phase 3 distribute stub — no public platform post',
+                'note': 'Phase 4 distribute — YouTube live if creds; else staging-only',
             })
     return {
         'job': _serialize_row(row),
@@ -192,7 +197,10 @@ async def approve_job(
         'distribute_enqueued': work is not None,
         'work_id': int(work['id']) if work else None,
         'public_post': False,
-        'note': 'Approved for distribution stub only. Phase 4 wires real platform publish.',
+        'note': (
+            'Approved. Distribute runs via worker: YouTube when OAuth env set + local '
+            'video; otherwise staging export only. TikTok/Reels never auto-post.'
+        ),
     }
 
 

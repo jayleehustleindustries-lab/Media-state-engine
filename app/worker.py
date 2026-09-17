@@ -67,8 +67,8 @@ async def process_work_item(item: dict[str, Any]) -> None:
         elif step == "flush_outbox":
             result = await outbox.flush_outbox(limit=int(payload.get("limit", 50)))
         elif step == "distribute":
-            # Phase 3 stub — refuses unless job is approved; no public platform APIs
-            result = await pipeline.distribute_stub(job_id)
+            # Phase 4 — refuses unless approved; YouTube live only with OAuth + local file
+            result = await pipeline.distribute(job_id)
         else:
             raise ValueError(f"unknown step: {step}")
 

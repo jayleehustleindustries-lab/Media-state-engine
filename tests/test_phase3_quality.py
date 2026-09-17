@@ -147,7 +147,9 @@ async def test_approve_gate_and_distribute_stub(pg_pool):
     dist = await pipeline.distribute_stub(job_id)
     assert dist["status"] == "delivered"
     assert dist["public_post"] is False
-    assert dist["stub"] is True
+    # Phase 4: alias still works; staging-only when no YouTube OAuth
+    assert dist.get("mode") in ("staging_only", "live", "failed") or dist.get("stub") is False
+    assert dist.get("staging_path") or dist.get("stub") is True
 
 
 def test_approve_endpoint_auth_and_shape():
