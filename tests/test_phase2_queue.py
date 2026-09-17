@@ -115,6 +115,7 @@ async def test_mark_failure_retries_then_dead(pg_pool):
 
 
 @pytest.mark.asyncio
+@pytest.mark.soft_image_gate
 async def test_worker_tick_runs_generate_avatar(pg_pool):
     from app.services.heygen import HeyGenVideo
     from app import worker

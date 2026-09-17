@@ -34,6 +34,7 @@ async def pg_pool(require_database_url):
 
 
 @pytest.mark.asyncio
+@pytest.mark.soft_image_gate
 async def test_generate_avatar_uses_kind_video(pg_pool, monkeypatch):
     from app.services import pipeline
     from app.services.heygen import HeyGenVideo
@@ -103,6 +104,7 @@ async def test_heygen_success_promotes_final(pg_pool):
 
 
 @pytest.mark.asyncio
+@pytest.mark.soft_image_gate
 async def test_provider_error_fails_and_clears_key(pg_pool):
     from app.services import pipeline
     from app.services.heygen import HeyGenRequestError
@@ -160,3 +162,19 @@ async def test_reconcile_applies_provider_failure(pg_pool):
     async with pg_pool.acquire() as conn:
         job = await conn.fetchrow('SELECT status FROM jobs WHERE id=$1', job_id)
     assert job['status'] == 'failed'
+
+
+@pytest.mark.asyncio
+async def test_generate_avatar_refuses_without_image_pass(pg_pool):
+    """#19: unmarked path must hit real gate fail-closed (no soft stub)."""
+    from app.services import pipeline
+    from app.services.image_gate import GateRefuse
+
+    async with pg_pool.acquire() as conn:
+        job = await conn.fetchrow(
+            "INSERT INTO jobs(script_text, status) VALUES('script', 'script_ready') RETURNING *"
+        )
+        job_id = job['id']
+
+    with pytest.raises(GateRefuse):
+        await pipeline.generate_avatar(job_id)

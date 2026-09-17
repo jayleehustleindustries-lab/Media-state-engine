@@ -223,6 +223,7 @@ async def test_cli_approve(pg_pool, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.soft_image_gate
 async def test_dual_format_no_second_heygen_by_default(pg_pool, monkeypatch):
     from app.services import pipeline, jobs
     from app.services.heygen import HeyGenVideo
@@ -259,6 +260,7 @@ async def test_dual_format_no_second_heygen_by_default(pg_pool, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.soft_image_gate
 async def test_dual_format_paid_when_env_allows(pg_pool, monkeypatch):
     from app.services import pipeline, jobs
     from app.services.heygen import HeyGenVideo

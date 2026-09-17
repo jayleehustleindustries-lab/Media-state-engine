@@ -64,8 +64,12 @@ async def truncate_app_tables(conn):
 
 @pytest.fixture(autouse=True)
 def soft_image_gate_for_legacy_pipeline(request, monkeypatch):
-    """Phase 1–5 pipeline tests predate SoT image-gate eligibility; keep image_gate tests strict."""
-    if "test_image_gate" in request.node.nodeid:
+    """Opt-in stub for legacy HeyGen unit paths (#19).
+
+    Only tests marked ``@pytest.mark.soft_image_gate`` skip the real likeness
+    gate. Default / unmarked tests (incl. ``test_image_gate``) stay fail-closed.
+    """
+    if request.node.get_closest_marker("soft_image_gate") is None:
         return
 
     async def _pass(conn, job_id):
