@@ -1,50 +1,26 @@
-# Deploy
+# Deploy — Media State Engine (FastAPI)
 
-## Schema source of truth (CRITICAL)
+## Schema source of truth (critical)
 
-Apply **in order**:
+For new environments, the single schema source of truth is `supabase/migrations/`,
+applied in lexical order by the repository script:
 
 1. `supabase/migrations/20260317000001_media_state_engine_core.sql`
 2. `supabase/migrations/20260317000002_media_state_engine_auth_and_quality.sql`
 3. `supabase/migrations/20260317000003_app_adjuncts.sql`
 4. `supabase/migrations/20260317000004_image_gate.sql`
+5. `supabase/migrations/20260317000005_image_gate_caps.sql`
 
 ```bash
 export DATABASE_URL=postgresql://...
 ./scripts/apply_migrations.sh
 ```
 
-Legacy `schema.sql` + `migrations/00x_phase*.sql` are **LEGACY** — do not apply to new environments.
-Approval gate remains sacred: **publish only via `approved → published`**.
-Image gate is mandatory before HeyGen: **`assert_image_pass_for_heygen` in same txn as key reserve**.
-
-
-# Deploy — Media State Engine (FastAPI)
-
-## Schema source of truth (critical)
-
-**This service uses only:**
-
-1. `schema.sql` (base + consolidated FastAPI tables)
-2. `migrations/*.sql` in lexical order (`001` → `004` …)
-
-```bash
-psql "$DATABASE_URL" -f schema.sql
-for f in migrations/*.sql; do psql "$DATABASE_URL" -f "$f"; done
-```
-
-On a fresh DB, `schema.sql` already includes Phase 1–4 objects; re-running
-`migrations/*.sql` is idempotent (`IF NOT EXISTS` / additive ALTERs). Prefer
-applying both so ops muscle memory stays consistent.
-
-### Do NOT use the Drive / Supabase SQL packs
-
-Files such as `001_media_state_engine_core.sql` and
-`002_media_state_engine_auth_and_quality.sql` (under any `supabase-schema/`
-tree) describe a **different** status vocabulary and RPC graph (`draft`,
-`tts_*`, `published`, etc.). Applying them to this FastAPI database will
-break workers and can reintroduce approval-skip edges that this app does
-not use. **Never deploy those packs for this service.**
+The root `schema.sql` and `migrations/00x_phase*.sql` files are **LEGACY**
+reference files; do not apply them to new environments.
+Approval remains sacred: **publish only via `approved → published`**. The image
+gate is mandatory before HeyGen: `assert_image_pass_for_heygen` runs in the
+same transaction as key reservation.
 
 ## Processes (same Docker image)
 
@@ -85,14 +61,14 @@ service from the same image with start command `python -m app.worker`
 
 ## Approval / publish path
 
-Jobs land in `staged` after render. Public/live distribute requires
-`POST /jobs/{id}/approve` (not generic `/advance`). Worker runs
-`distribute` after approve. Generic advance **rejects** `approved` and
-`delivered` targets (audit F5).
+Jobs land in `staged` after render. Public/live distribution requires
+`POST /jobs/{id}/approve` (not generic `/advance`). The worker runs
+`distribute` after approval. Generic advance **rejects** `approved` and
+`delivered` targets (audit F5). There is no automatic public publishing.
 
 ## Checklist
 
-1. Apply FastAPI `schema.sql` + `migrations/` only
+1. Apply `supabase/migrations/` with `./scripts/apply_migrations.sh`
 2. Set API key (fail-closed)
 3. Deploy API + worker from the same image
 4. Confirm `GET /health` on the API

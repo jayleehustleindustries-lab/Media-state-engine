@@ -39,17 +39,16 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # set DATABASE_URL + MEDIA_ENGINE_API_KEY
-psql "$DATABASE_URL" -f schema.sql
-# optional / ops habit: for f in migrations/*.sql; do psql "$DATABASE_URL" -f "$f"; done
+./scripts/apply_migrations.sh
 uvicorn app.main:app --reload          # API (port 8000 local)
 python -m app.worker                   # separate process
 ```
 
 Docker / Railway use port **8080**. Health: `GET /health`.
 
-> **Schema SoT:** only `schema.sql` + `migrations/`. Do **not** apply
-> Drive/Supabase packs (`001_media_state_engine_core.sql`, etc.) — different
-> product/graph. Details: [`docs/DEPLOY.md`](docs/DEPLOY.md).
+> **Schema SoT for new deploys:** `supabase/migrations/` in lexical order,
+> applied with `./scripts/apply_migrations.sh`. Root `schema.sql` +
+> `migrations/00x_phase*.sql` are **LEGACY**. Details: [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ## Pipeline (operator)
 
