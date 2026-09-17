@@ -25,13 +25,11 @@ def require_database_url(database_url):
 
 
 async def apply_schema(conn):
-    """Drop + recreate so Phase 4 schema (schedule + metrics) are present in tests."""
-    await conn.execute(
-        """
-        DROP TABLE IF EXISTS metric_samples, metric_counters, schedule_runs,
-                             work_queue, webhook_outbox, idempotency_keys,
-                             events, assets, jobs CASCADE
-        """
-    )
-    schema = Path(__file__).resolve().parents[1] / "schema.sql"
-    await conn.execute(schema.read_text())
+    """Reset public schema and apply deploy SoT: supabase/migrations/*.sql."""
+    await conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+    await conn.execute("CREATE SCHEMA public")
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+    root = Path(__file__).resolve().parents[1]
+    mig_dir = root / "supabase" / "migrations"
+    for path in sorted(mig_dir.glob("*.sql")):
+        await conn.execute(path.read_text())

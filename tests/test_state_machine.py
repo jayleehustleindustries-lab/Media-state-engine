@@ -17,6 +17,14 @@ class FakeConn:
             return dict(self.job)
         return None
 
+    async def fetchval(self, sql, *args):
+        # Unit FakeConn is legacy-shaped: no transition_job / job_status enum.
+        if 'transition_job' in sql or "typname='job_status'" in sql:
+            return False
+        if "table_name='job_events'" in sql:
+            return None
+        return None
+
     async def execute(self, sql, *args):
         if sql.startswith('INSERT INTO events'):
             self.events.append({'from': args[1], 'to': args[2]})
