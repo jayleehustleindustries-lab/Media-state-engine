@@ -1,9 +1,8 @@
 -- =============================================================================
--- SCHEMA SOURCE OF TRUTH (FastAPI Media State Engine)
--- Apply this file, then migrations/*.sql in lexical order, against the DB used
--- by this service. Do NOT apply Drive/Supabase packs such as
--- 001_media_state_engine_core.sql / 002_media_state_engine_auth_and_quality.sql
--- — those are a different product/status graph and will break this app.
+-- LEGACY schema dump (NOT the deploy source of truth)
+-- New environments: apply supabase/migrations/*.sql via ./scripts/apply_migrations.sh
+-- (see docs/DEPLOY.md). Do not treat this file + migrations/00x_phase*.sql as SoT.
+-- Outside-repo Drive packs under supabase-schema/ are also not the install path.
 -- =============================================================================
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
