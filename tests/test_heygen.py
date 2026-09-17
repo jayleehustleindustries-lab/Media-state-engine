@@ -10,7 +10,13 @@ def signed(body: bytes, secret: str) -> str:
 
 
 def test_valid_signature_and_webhook_extraction():
-    body = json.dumps({'event_type': 'avatar_video.success', 'event_data': {'video_id': 'vid_123', 'video_url': 'https://cdn/video.mp4'}}, separators=(',', ':')).encode()
+    body = json.dumps(
+        {
+            'event_type': 'avatar_video.success',
+            'event_data': {'video_id': 'vid_123', 'video_url': 'https://cdn/video.mp4'},
+        },
+        separators=(',', ':'),
+    ).encode()
     payload = parse_webhook(body, signed(body, 'secret'), 'secret')
     event_type, video_id, data = webhook_video(payload)
     assert event_type == 'avatar_video.success'

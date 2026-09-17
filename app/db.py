@@ -12,9 +12,17 @@ async def connect() -> asyncpg.Pool:
 
 async def close() -> None:
     global _pool
-    if _pool:
-        await _pool.close()
-        _pool = None
+    if _pool is None:
+        return
+    pool, _pool = _pool, None
+    try:
+        await pool.close()
+    except RuntimeError:
+        # Prior pytest asyncio loop already closed; drop sockets hard.
+        try:
+            pool.terminate()
+        except Exception:
+            pass
 
 @asynccontextmanager
 async def transaction():

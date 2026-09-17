@@ -1,43 +1,124 @@
 # Media State Engine
 
-An atomic PostgreSQL state engine for vertical-video automation. It coordinates a script, ElevenLabs audio generation, Remotion rendering, and downstream delivery notifications without allowing illegal state changes or duplicate paid generation calls.
+PostgreSQL-backed state engine for short-form vertical video: script → HeyGen
+avatar (optional ElevenLabs audio) → staged review → **human approve** →
+YouTube Shorts distribute (or staging export). Illegal transitions and
+duplicate paid provider calls are blocked at the DB/app layer.
 
 ## Guarantees
 
-Every state transition locks the job row with `SELECT ... FOR UPDATE`, validates the directed edge, inserts an event, updates `jobs.status`, and commits through the same database transaction. Illegal transitions return HTTP 409 and do not create events. Audio and render operations reserve `{job_id}:audio` and `{job_id}:render` before calling an external provider, so concurrent requests cannot double-spend. A reserved key with no result represents an interrupted operation and is returned as `in_progress`; operators can reconcile it rather than silently issuing a second provider call. The delivery webhook is sent only after the transaction that commits `rendered` has completed.
+- Every status change locks the job (`SELECT … FOR UPDATE`), validates
+  `app/state_machine.py` edges, writes an `events` row, then updates
+  `jobs.status` in one transaction.
+- Provider steps use `idempotency_keys` and a Postgres `work_queue`
+  (`FOR UPDATE SKIP LOCKED`). Outbound review webhooks use
+  `webhook_outbox` with backoff + DLQ.
+- **Nothing public-posts without explicit approve.** Generic
+  `POST /jobs/{id}/advance` cannot target `approved` or `delivered`
+  (use `/approve` + distribute worker).
+- API auth fails closed when `MEDIA_ENGINE_API_KEY` / `API_KEY` is unset.
+
+## Status graph (current)
+
+```
+pending → script_ready → audio_generating → audio_ready
+        ↘              ↘
+         rendering → rendered → staged → approved → delivered
+Any active state → failed. Terminal: delivered, failed.
+```
+
+`staged` = awaiting human approval. `approved → delivered` runs only via
+the distribute worker after `/approve`.
 
 ## Local setup
 
-Use Python 3.11 or newer and a PostgreSQL database with `pgcrypto` available. Install dependencies, copy `.env.example` to `.env`, set `DATABASE_URL`, and run `schema.sql` against the database.
+Python 3.11+, Postgres with `pgcrypto`.
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-psql "$DATABASE_URL" -f schema.sql
-uvicorn app.main:app --reload
+cp .env.example .env   # set DATABASE_URL + MEDIA_ENGINE_API_KEY
+./scripts/apply_migrations.sh
+uvicorn app.main:app --reload          # API (port 8000 local)
+python -m app.worker                   # separate process
 ```
 
-The service exposes `GET /health` and listens on port 8000 locally. Docker uses port 8080.
+Docker / Railway use port **8080**. Health: `GET /health`.
 
-## Pipeline
+> **Schema SoT for new deploys:** `supabase/migrations/` in lexical order,
+> applied with `./scripts/apply_migrations.sh`. Root `schema.sql` +
+> `migrations/00x_phase*.sql` are **LEGACY**. Details: [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
-Create a job with `POST /jobs`, advance it to `script_ready`, and call `POST /jobs/{id}/generate-audio`. After audio is committed, call `POST /jobs/{id}/render`. That endpoint commits the final asset and `rendered` status before calling `WEBHOOK_URL`. A delivery transition is explicit through `POST /jobs/{id}/advance` with `{"to_status":"delivered"}`.
+## Pipeline (operator)
 
-The allowed edges are `pending → script_ready → audio_generating → audio_ready → rendering → rendered → delivered`, with `failed` reachable from any active state. `delivered` and `failed` are terminal.
+1. `POST /jobs` — structured script + platform captions; usually lands
+   `script_ready`.
+2. `POST /jobs/{id}/generate-avatar` (and/or `generate-audio` / `render`) →
+   **202** with `work_id`; worker performs provider I/O.
+3. After render, job is **`staged`** (awaiting approval). Review via
+   `GET /jobs/{id}/detail`.
+4. `POST /jobs/{id}/approve` — sets audit fields, enqueues `distribute`.
+5. Worker distribute: YouTube live when OAuth + local MP4 exist; otherwise
+   staging under `data/staging/{job_id}/`. TikTok/Reels captions stay
+   documented-only (never auto-posted).
 
-## Configuration
+Auth: `Authorization: Bearer $MEDIA_ENGINE_API_KEY` or `X-API-Key`.
 
-The deployment requires `DATABASE_URL`, `ELEVENLABS_API_KEY`, `REMOTION_RENDER_URL`, `WEBHOOK_URL`, and `WEBHOOK_SECRET`. `ELEVENLABS_VOICE_ID` and `ELEVENLABS_URL` select the TTS voice and endpoint. The delivery request contains an HMAC-SHA256 signature in `x-webhook-signature`.
+```bash
+curl -X POST "$HOST/jobs/$ID/approve" \
+  -H "Authorization: Bearer $MEDIA_ENGINE_API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"approved_by":"jordan"}'
+```
+
+CLI: `python -m app.cli approve <job_id> --by jordan`
+
+## Scheduling + metrics (Phase 4)
+
+```bash
+python -m app.cli schedule-tick
+python -m app.cli schedule-status
+# or POST /admin/scheduler/tick  (API key)
+```
+
+Default cadence: `SCHEDULE_POSTS_PER_DAY` (often 2–3) in
+`America/Los_Angeles`. Keep `SCHEDULE_ENQUEUE_AVATAR=false` unless you
+intend cron to enqueue HeyGen. Metrics: `GET /metrics` /
+`GET /admin/metrics`.
+
+## Configuration (high level)
+
+| Area | Vars |
+|------|------|
+| DB / auth | `DATABASE_URL`, `MEDIA_ENGINE_API_KEY` |
+| HeyGen | `HEYGEN_API_KEY`, avatar/voice ids, webhook secret, `PUBLIC_BASE_URL` |
+| ElevenLabs | `ELEVENLABS_*` (optional path) |
+| Outbox | `WEBHOOK_URL`, `WEBHOOK_SECRET` |
+| Worker | `WORKER_*`, `STUCK_JOB_SECONDS`, stale reclaim seconds |
+| Schedule | `SCHEDULE_*` |
+| YouTube | `YOUTUBE_CLIENT_*`, `YOUTUBE_REFRESH_TOKEN`, `YOUTUBE_PRIVACY_STATUS` |
+
+See `.env.example` and [`docs/DEPLOY.md`](docs/DEPLOY.md).
+
+## Deployment
+
+Same image for API and worker — see Dockerfile comments and
+[`docs/DEPLOY.md`](docs/DEPLOY.md). Railway healthcheck: `/health`.
 
 ## Tests
 
 ```bash
 pytest -q
+# Postgres integration tests skip when DATABASE_URL is unset
 ```
 
-The suite covers event-before-status semantics, illegal transitions producing zero events, and concurrent transition serialization. Production integration tests should run against an isolated PostgreSQL database and mock provider HTTP calls.
+## Phase reports
 
-## Deployment
-
-Railway can build from the included `Dockerfile` and use `railway.toml` for `/health` checks. Fly.io can use the same image. Run `schema.sql` once in Supabase before starting the service, then configure the variables in `.env.example`.
+| Phase | Report |
+|-------|--------|
+| 1 Auth, outbox/DLQ, reconcile, asset kinds | [PHASE1_REPORT.md](PHASE1_REPORT.md) |
+| 2 Work queue worker + async providers | [PHASE2_REPORT.md](PHASE2_REPORT.md) |
+| 3 Script quality, dual-format guard, approve gate | [PHASE3_REPORT.md](PHASE3_REPORT.md) |
+| 4 Scheduler, YouTube distribute, metrics | [PHASE4_REPORT.md](PHASE4_REPORT.md) |
+| 5 Deploy docs, SoT, audit F1–F5 fixes | [PHASE5_REPORT.md](PHASE5_REPORT.md) |

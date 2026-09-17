@@ -1,0 +1,191 @@
+{
+  "schema_version": "1.0.0",
+  "locked_at": "2026-09-17T04:16:00-07:00",
+  "locked_at_label": "2026-09-17 PT",
+  "pack_id": "JLF_AVATAR_V1_ACTIVE_REF_SET",
+  "manifest_id": "JLF-20260629-001_REF_MANIFEST_20260704",
+  "campaign_id": "JLF-20260629-001",
+  "likeness_approval_status": "approved",
+  "canonical_folder_id": "18LyuDwO9szSK6wvGbB_ZTnooDKafbmDZ",
+  "canonical_folder_note": "Soul training / athlete selected soulref_* set. This is the ONLY active ground-truth folder. Jordan confirmed 2026-09-17 PT: this pack is THE active MSE ground truth.",
+  "identity_lock": {
+    "primary_face_anchor": "soulref_01",
+    "primary_local_path": "/workspace/media-state-engine/reference_images/avatar_v1_hero_identity.jpeg",
+    "primary_drive_file_id": "17Y-Yfn3yo5RdN0mDogHbvg2FiD1Ej3UN",
+    "primary_sha256": "f33f7f2416d96ec28ff7caf8650331fb05c6d5648e251164a479e0b0d5f1509d",
+    "rule": "Motion/texture/wardrobe/full_body refs must NOT redesign the face. Compare identity against hero_identity."
+  },
+  "images": [
+    {
+      "role": "hero_identity",
+      "soulref": "soulref_01",
+      "drive_file_id": "17Y-Yfn3yo5RdN0mDogHbvg2FiD1Ej3UN",
+      "local_path": "/workspace/media-state-engine/reference_images/avatar_v1_hero_identity.jpeg",
+      "filename": "avatar_v1_hero_identity.jpeg",
+      "sha256": "f33f7f2416d96ec28ff7caf8650331fb05c6d5648e251164a479e0b0d5f1509d",
+      "bytes": 674250,
+      "mime": "image/jpeg",
+      "allowed_uses": [
+        "identity"
+      ],
+      "never_use_to_redesign_face": false,
+      "notes": "PRIMARY face anchor. Cap, facial hair, eyes, expression. identity_lock."
+    },
+    {
+      "role": "backup",
+      "soulref": "soulref_02",
+      "drive_file_id": "1gwhc75bLG8u4-9rgWMbxJXzT51nse2PJ",
+      "local_path": "/workspace/media-state-engine/reference_images/avatar_v1_backup.jpeg",
+      "filename": "avatar_v1_backup.jpeg",
+      "sha256": "60009a8582ba6c88cc57b939acba1ccd0dcc7bfccb823a5298538d50f694fe5d",
+      "bytes": 741148,
+      "mime": "image/jpeg",
+      "allowed_uses": [
+        "identity"
+      ],
+      "never_use_to_redesign_face": false,
+      "notes": "Secondary face consistency across lighting/expression. Reinforce only; do not redesign."
+    },
+    {
+      "role": "texture",
+      "soulref": "soulref_03",
+      "drive_file_id": "1Jw6d6lZBV5DF_AVfJaqw7gYhE1jHF0lf",
+      "local_path": "/workspace/media-state-engine/reference_images/avatar_v1_texture.jpeg",
+      "filename": "avatar_v1_texture.jpeg",
+      "sha256": "d3f9585b87d174e45fac73f8b54544b426280b58dc49596a3fae08b20a5bd158",
+      "bytes": 1007307,
+      "mime": "image/jpeg",
+      "allowed_uses": [
+        "texture_only"
+      ],
+      "never_use_to_redesign_face": true,
+      "notes": "Sweat/skin realism only. NOT a sole identity ref."
+    },
+    {
+      "role": "profile",
+      "soulref": "soulref_05",
+      "drive_file_id": "15QYBzO6vyr3tZ0aOIDrxga_pXAv3mgjn",
+      "local_path": "/workspace/media-state-engine/reference_images/avatar_v1_profile.jpeg",
+      "filename": "avatar_v1_profile.jpeg",
+      "sha256": "ff53e092f49801134ec358fa83849f91c145668a9ea4ddefe768404d93ab43ae",
+      "bytes": 758657,
+      "mime": "image/jpeg",
+      "allowed_uses": [
+        "identity"
+      ],
+      "never_use_to_redesign_face": false,
+      "notes": "Side profile: head shape, nose, jawline, cap. Desk/transition scenes."
+    },
+    {
+      "role": "motion",
+      "soulref": "soulref_06",
+      "drive_file_id": "1Ot-L3aD0Tk2fT2tOvtGvz_tIJ8sSWcSJ",
+      "local_path": "/workspace/media-state-engine/reference_images/avatar_v1_motion_squat.jpeg",
+      "filename": "avatar_v1_motion_squat.jpeg",
+      "sha256": "2a2f88dcd91264565b0407bbc5def20ce95831078e78ce2ba934e2c4e212a405",
+      "bytes": 579836,
+      "mime": "image/jpeg",
+      "allowed_uses": [
+        "motion_only"
+      ],
+      "never_use_to_redesign_face": true,
+      "notes": "Squat / strength movement. Anatomy + gym action only. Do NOT redesign face."
+    },
+    {
+      "role": "full_body",
+      "soulref": "soulref_07",
+      "drive_file_id": "1l8t8xSlUJCL5FRj4YKnn0MZWZBKDSc7U",
+      "local_path": "/workspace/media-state-engine/reference_images/avatar_v1_full_body.png",
+      "filename": "avatar_v1_full_body.png",
+      "sha256": "1c9e7c549d647765750343c055a19d38f84dc263582ed03b3b18651e5445ce81",
+      "bytes": 6556279,
+      "mime": "image/png",
+      "allowed_uses": [
+        "motion_only"
+      ],
+      "never_use_to_redesign_face": true,
+      "notes": "Full-frame body proportions / rack. NOT sole identity ref."
+    },
+    {
+      "role": "motion",
+      "soulref": "soulref_08",
+      "drive_file_id": "1jFKi9LbGazJ0nPyXBQG2osrhwG4YPYhk",
+      "local_path": "/workspace/media-state-engine/reference_images/avatar_v1_motion_row.jpeg",
+      "filename": "avatar_v1_motion_row.jpeg",
+      "sha256": "c78e91865bd74aea47ddf62dd1db94fa52b6ebec127d07ec12f31e9e89cce418",
+      "bytes": 861715,
+      "mime": "image/jpeg",
+      "allowed_uses": [
+        "motion_only"
+      ],
+      "never_use_to_redesign_face": true,
+      "notes": "Row / pulling posture. Keep face anchored to hero."
+    },
+    {
+      "role": "wardrobe",
+      "soulref": "soulref_09",
+      "drive_file_id": "1UbVuBWhs_-rjDIUMviQzzH1Preo0Ec_t",
+      "local_path": "/workspace/media-state-engine/reference_images/avatar_v1_wardrobe_seated.jpeg",
+      "filename": "avatar_v1_wardrobe_seated.jpeg",
+      "sha256": "f5d46f30569859aa679f86a15cf1a327e506e4605feadaab1c66bd6e46a7ae7c",
+      "bytes": 347444,
+      "mime": "image/jpeg",
+      "allowed_uses": [
+        "wardrobe"
+      ],
+      "never_use_to_redesign_face": true,
+      "notes": "Seated/studio wardrobe + posture. Non-lift framing."
+    }
+  ],
+  "scoring_policy": {
+    "identity_likeness_hard_veto": true,
+    "overall_ge_8_insufficient": true,
+    "empty_set_fail_closed": true,
+    "max_redo": 3,
+    "score_before_heygen": true,
+    "motion_or_texture_cannot_be_sole_identity_refs": true,
+    "require_hero_identity_comparison": true,
+    "fail_closed_on_scorer_errors": true,
+    "bind_score_to_ref_content_hash": true,
+    "notes": "Caps from image-gate-audit MUST-HAVE. Engine must load this pack; do not watch empty Google-avatar theater folder."
+  },
+  "rejected": [
+    {
+      "soulref": "soulref_04",
+      "drive_file_id": "1Y0fcxj0kAfuaM8D9WeckUliWFb3gJ0Uy",
+      "reason": "Uploaded as backup but not selected; keep active set at eight images."
+    },
+    {
+      "type": "contaminated_folder",
+      "folder_id": "1XvR1in768pWbh7DIEcd_gEQB7UnpxNr9",
+      "folder_name": "AVATAR REFERENCE IMAGES ",
+      "warning": "CONTAMINATED. Contains HEICs PLUS recovery-codes.pages / recovery-codes.txt. NEVER watch this folder for refs. Do NOT open or read recovery-codes contents. Not a ground-truth source.",
+      "recovery_codes_contents": "NOT_READ_NOT_INCLUDED"
+    },
+    {
+      "type": "unused_empty_folder",
+      "folder_id": "19EzKpLv1U38XC1keVZAP6GTfda9AarOQ",
+      "reason": "Returned empty via search; treat as unused."
+    },
+    {
+      "type": "theater_path",
+      "source": "Drive Doc reference_images_README.md",
+      "reason": "Says active set empty / Google avatar watch folder. That is THEATER. Real set is this athlete manifest pack."
+    }
+  ],
+  "engine_load_contract": {
+    "must_load_path": "/workspace/media-state-engine/reference_images/ACTIVE_REFERENCE_SET.json",
+    "refs_dir": "/workspace/media-state-engine/reference_images/",
+    "image_count": 8,
+    "do_not_implement_gate_in_this_task": false,
+    "media_state_engine_gate": "IMPLEMENTED"
+  },
+  "jordan_confirmed": true,
+  "jordan_confirmed_at": "2026-09-17T04:17:44-07:00",
+  "status": "active_locked",
+  "active_for": "Media-state-engine",
+  "drive_mirror": {
+    "canonical_folder_id": "18LyuDwO9szSK6wvGbB_ZTnooDKafbmDZ",
+    "note": "Drive remains source-of-truth mirror; engine loads local reference_images/ copy bound by sha256."
+  }
+}

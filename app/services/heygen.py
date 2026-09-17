@@ -101,6 +101,7 @@ async def create_video(
     dimension: tuple[int, int] = (1080, 1920),
     background_color: str | None = None,
     callback_id: str | None = None,
+    callback_url: str | None = None,
     idempotency_key: str | None = None,
     engine: dict[str, Any] | None = None,
 ) -> HeyGenVideo:
@@ -109,6 +110,11 @@ async def create_video(
     Use exactly one audio mode: ``script_text`` with an optional ``voice_id`` or
     a public ``audio_url`` for lip-sync. The provider's idempotency header is
     populated when ``idempotency_key`` is supplied.
+
+    Primary path is **Direct Video** (``POST /v3/videos``) for scripted control
+    over avatar, voice, and dimensions. Pass ``callback_url`` (or configure
+    ``HEYGEN_CALLBACK_URL`` / ``PUBLIC_BASE_URL``) so HeyGen pushes completion
+    instead of requiring polling; Phase 1 reconcile remains as a safety net.
     """
     api_key, base_url = _require_config()
     configured_avatar = getattr(settings, "heygen_avatar_id", "")
@@ -140,6 +146,9 @@ async def create_video(
     }
     if callback_id:
         payload["callback_id"] = callback_id
+    resolved_callback = (callback_url or "").strip() or settings.effective_heygen_callback_url
+    if resolved_callback:
+        payload["callback_url"] = resolved_callback
     if engine:
         payload["engine"] = engine
 
