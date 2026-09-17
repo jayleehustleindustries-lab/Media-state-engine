@@ -61,13 +61,23 @@ async def process_work_item(item: dict[str, Any]) -> None:
                     prompt=payload.get("prompt") or "",
                 )
         elif step == "revise_image":
-            from .services.image_gate import run_revise_image_step
+            from .services.image_gate import run_revise_image_step, GateRefuse
             async def _regen(jid, prompt, refs):
-                return {
-                    "url": payload.get("revised_url")
-                    or payload.get("candidate_url")
-                    or "mock://revised"
-                }
+                # Fail closed: never silent mock theater → HeyGen.
+                # Accept only an explicit real URL from payload or a configured regenerator.
+                url = (payload.get("revised_url") or "").strip()
+                if not url:
+                    # Optional future hook: settings-backed regenerator callback.
+                    # Until wired, refuse rather than inventing mock://revised.
+                    raise GateRefuse(
+                        "revise_image: no real regenerator configured "
+                        "(payload.revised_url required); refusing mock theater path"
+                    )
+                if url.startswith("mock://"):
+                    raise GateRefuse(
+                        f"revise_image: refusing mock theater URL {url!r}"
+                    )
+                return {"url": url}
             async with transaction() as conn:
                 result = await run_revise_image_step(conn, job_id, regenerate=_regen)
         elif step == "generate_audio":

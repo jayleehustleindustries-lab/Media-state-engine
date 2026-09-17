@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 from uuid import UUID
 
 from ...config import settings
+from .budget import BudgetExhausted, consume_scorer_budget, ensure_budget_table
 from .refs import ActiveReferenceSet, ReferenceSetError, load_active_reference_set
 from .scorer import ScoreCard, ScorerError, score_candidate
 
@@ -28,6 +29,18 @@ def evaluate_pass(card: ScoreCard) -> bool:
 
 def _prompt_hash(prompt: str) -> str:
     return hashlib.sha256((prompt or "").encode()).hexdigest()
+
+
+def _max_attempts() -> int:
+    """Hard cap ≤3 regardless of misconfigured env."""
+    return max(1, min(int(settings.image_gate_max_attempts or 3), 3))
+
+
+def _job_meta(job) -> dict[str, Any]:
+    meta = job["meta"] if job and "meta" in job.keys() else {}
+    if isinstance(meta, str):
+        meta = json.loads(meta or "{}")
+    return dict(meta or {})
 
 
 async def record_score(
@@ -130,11 +143,65 @@ async def record_score(
     return dict(row)
 
 
+async def _audit_break_glass(conn, job_id: UUID, meta: dict[str, Any]) -> None:
+    await ensure_budget_table(conn)
+    await conn.execute(
+        """
+        INSERT INTO image_gate_break_glass_audit
+          (job_id, actor, reason, env_flag, job_flag, meta)
+        VALUES ($1, $2, $3, true, true, $4::jsonb)
+        """,
+        job_id,
+        str(meta.get("break_glass_actor") or meta.get("actor") or "break_glass"),
+        str(meta.get("break_glass_reason") or "dual_control_break_glass"),
+        json.dumps({"job_meta_keys": sorted(meta.keys()), "source": "assert_pass_for_heygen"}),
+    )
+
+
 async def assert_pass_for_heygen(conn, job_id: UUID) -> dict[str, Any]:
-    """Must run in the same DB transaction as HeyGen key reserve."""
+    """Must run in the same DB transaction as HeyGen key reserve.
+
+    Break-glass is sealed: IMAGE_GATE_BREAK_GLASS env alone is NOT enough.
+    Requires dual-control (env AND per-job meta.break_glass_image_gate) plus a
+    durable audit row. Otherwise refuse — never silent bypass.
+    """
     if settings.image_gate_break_glass:
-        log.error("IMAGE_GATE_BREAK_GLASS enabled — HeyGen assert bypassed for job %s", job_id)
-        return {"break_glass": True}
+        job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_id)
+        if not job:
+            raise GateRefuse("job not found")
+        meta = _job_meta(job)
+        job_flag = bool(
+            meta.get("break_glass_image_gate")
+            or meta.get("image_gate_break_glass")
+        )
+        if not job_flag:
+            log.error(
+                "IMAGE_GATE_BREAK_GLASS env set but job %s lacks audited "
+                "break_glass_image_gate flag — refusing",
+                job_id,
+            )
+            raise GateRefuse(
+                "break_glass refused: dual-control required "
+                "(env IMAGE_GATE_BREAK_GLASS AND job meta.break_glass_image_gate) "
+                "plus durable audit"
+            )
+        try:
+            await _audit_break_glass(conn, job_id, meta)
+        except Exception as exc:  # noqa: BLE001
+            log.error("break_glass audit insert failed for %s: %s", job_id, exc)
+            raise GateRefuse(
+                f"break_glass refused: durable audit required but failed: {exc}"
+            ) from exc
+        log.error(
+            "IMAGE_GATE_BREAK_GLASS dual-control AUDITED bypass for job %s",
+            job_id,
+        )
+        return {
+            "break_glass": True,
+            "audited": True,
+            "id": job.get("image_score_id"),
+            "ref_content_hash": job.get("image_ref_content_hash"),
+        }
 
     try:
         row = await conn.fetchrow("SELECT * FROM assert_image_pass_for_heygen($1)", job_id)
@@ -221,14 +288,81 @@ async def run_score_image_step(
         refs.content_hash,
     )
 
-    attempt_n = max(int(job["image_attempt"] or 0), 1)
+    # Atomically increment BEFORE scoring (work_queue score_image / revise_image path)
+    bumped = await conn.fetchrow(
+        """
+        UPDATE jobs
+           SET image_attempt = COALESCE(image_attempt, 0) + 1,
+               updated_at = now()
+         WHERE id = $1
+        RETURNING image_attempt
+        """,
+        job_id,
+    )
+    attempt_n = int(bumped["image_attempt"])
+    max_att = _max_attempts()
+
+    if attempt_n > max_att:
+        await transition(
+            conn,
+            job_id,
+            "needs_human_review",
+            actor="image_gate",
+            reason="max_image_attempts_exceeded",
+            payload={"attempt_n": attempt_n, "max": max_att},
+        )
+        raise GateRefuse(
+            f"image_attempt={attempt_n} exceeds max={max_att} — "
+            "needs_human_review; HeyGen refused"
+        )
+
+    # Daily scorer budget — fail closed before any scorer / HeyGen spend
+    try:
+        await ensure_budget_table(conn)
+        await consume_scorer_budget(conn)
+    except BudgetExhausted as exc:
+        err_card = ScoreCard(
+            face_consistency=0,
+            lighting=0,
+            composition=0,
+            text_legibility=0,
+            brand_fit=0,
+            no_artifacts=0,
+            identity_likeness=0,
+            overall=0,
+            identity_drift=True,
+            failure_reasons=[f"budget_exhausted:{exc}"],
+            scorer="error",
+        )
+        await record_score(
+            conn,
+            job_id=job_id,
+            attempt_n=attempt_n,
+            card=err_card,
+            refs=refs,
+            prompt=prompt,
+            candidate_url=candidate_url,
+        )
+        dest = "needs_human_review" if attempt_n >= max_att else "image_failed"
+        await transition(
+            conn,
+            job_id,
+            dest,
+            actor="image_gate",
+            reason="scorer_budget_exhausted",
+            payload={"attempt_n": attempt_n},
+        )
+        raise GateRefuse(f"scorer budget fail-closed: {exc}") from exc
 
     try:
         card = await score_candidate(
             candidate_url=candidate_url, refs=refs, prompt=prompt, forced_card=forced_card
         )
     except (ScorerError, ReferenceSetError) as exc:
-        if settings.image_gate_fail_closed and not settings.image_gate_break_glass:
+        dual_glass = settings.image_gate_break_glass and _job_meta(job).get(
+            "break_glass_image_gate"
+        )
+        if settings.image_gate_fail_closed and not dual_glass:
             err_card = ScoreCard(
                 face_consistency=0,
                 lighting=0,
@@ -253,7 +387,7 @@ async def run_score_image_step(
             )
             dest = (
                 "needs_human_review"
-                if attempt_n >= settings.image_gate_max_attempts
+                if attempt_n >= max_att
                 else "image_failed"
             )
             await transition(conn, job_id, dest, actor="image_gate", reason=f"scorer_error:{exc}")
@@ -278,9 +412,9 @@ async def run_score_image_step(
             reason="image_pass",
             payload={"image_score_id": str(row["id"]), "overall": card.overall},
         )
-        return {"verdict": "pass", "score": dict(row), "status": "image_ready"}
+        return {"verdict": "pass", "score": dict(row), "status": "image_ready", "attempt_n": attempt_n}
 
-    if attempt_n >= settings.image_gate_max_attempts:
+    if attempt_n >= max_att:
         await transition(
             conn,
             job_id,
@@ -289,7 +423,7 @@ async def run_score_image_step(
             reason="max_image_attempts",
             payload={"attempt_n": attempt_n, "reasons": card.failure_reasons},
         )
-        return {"verdict": "fail", "score": dict(row), "status": "needs_human_review"}
+        return {"verdict": "fail", "score": dict(row), "status": "needs_human_review", "attempt_n": attempt_n}
 
     await transition(
         conn,
@@ -299,10 +433,32 @@ async def run_score_image_step(
         reason="image_fail",
         payload={"attempt_n": attempt_n, "reasons": card.failure_reasons},
     )
-    return {"verdict": "fail", "score": dict(row), "status": "image_failed"}
+    return {"verdict": "fail", "score": dict(row), "status": "image_failed", "attempt_n": attempt_n}
 
 
 RegenerateFn = Callable[[UUID, str, ActiveReferenceSet], Awaitable[dict[str, Any]]]
+
+
+def validate_regenerate_result(candidate: dict[str, Any] | None) -> str:
+    """Fail closed: refuse mock/empty regenerate theater paths."""
+    if not candidate or not isinstance(candidate, dict):
+        raise GateRefuse(
+            "revise_image: regenerator returned empty result — fail closed "
+            "(no silent mock pass to HeyGen)"
+        )
+    candidate_url = (
+        candidate.get("url") or candidate.get("candidate_url") or ""
+    ).strip()
+    if not candidate_url:
+        raise GateRefuse(
+            "revise_image: regenerator produced no candidate URL — fail closed"
+        )
+    if candidate_url.startswith("mock://"):
+        raise GateRefuse(
+            f"revise_image: refusing mock theater URL {candidate_url!r} — "
+            "configure a real regenerator or supply revised_url"
+        )
+    return candidate_url
 
 
 async def run_revise_image_step(
@@ -336,6 +492,17 @@ async def run_revise_image_step(
     meta["image_prompt_history"] = list(meta.get("image_prompt_history") or []) + [new_prompt]
     await conn.execute("UPDATE jobs SET meta=$2::jsonb WHERE id=$1", job_id, json.dumps(meta))
 
+    if int(job["image_attempt"] or 0) >= _max_attempts():
+        await transition(
+            conn,
+            job_id,
+            "needs_human_review",
+            actor="image_gate",
+            reason="max_image_attempts",
+            payload={"attempt_n": int(job["image_attempt"] or 0)},
+        )
+        raise GateRefuse("max image attempts already reached — revise refused")
+
     await transition(conn, job_id, "image_queued", actor="image_gate", reason="revise")
     await transition(
         conn,
@@ -347,7 +514,7 @@ async def run_revise_image_step(
     )
 
     candidate = await regenerate(job_id, new_prompt, refs)
-    candidate_url = candidate.get("url") or candidate.get("candidate_url") or ""
+    candidate_url = validate_regenerate_result(candidate)
     return await run_score_image_step(
         conn, job_id, candidate_url=candidate_url, prompt=new_prompt, forced_card=forced_card
     )

@@ -232,7 +232,34 @@ async def generate_avatar(job_id: UUID, avatar_id: str | None = None, voice_id: 
             async with transaction() as conn:
                 existing_h = await jobs.get_key(conn, h_key)
                 if not existing_h:
+                    # Dual-H: re-assert gate in SAME txn as horizontal reserve
+                    # (bind same pass score / ref hash — no skip path)
+                    gate_score_h = await assert_pass_for_heygen(conn, job_id)
                     await jobs.reserve_key(conn, h_key, job_id, 'heygen-avatar-h')
+                    await conn.execute(
+                        """
+                        UPDATE jobs
+                           SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb,
+                               updated_at = now()
+                         WHERE id = $1
+                        """,
+                        job_id,
+                        json.dumps({
+                            'formats': {
+                                'horizontal': {
+                                    'image_gate': 'pass',
+                                    'image_score_id': str(
+                                        gate_score_h.get('id')
+                                        or gate_score_h.get('image_score_id')
+                                        or ''
+                                    ),
+                                    'image_ref_content_hash': gate_score_h.get(
+                                        'ref_content_hash'
+                                    ),
+                                }
+                            }
+                        }),
+                    )
             if not existing_h:
                 horizontal_result = await heygen.create_video(
                     job_id=job_id,
