@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     worker_batch_size: int = 5
     worker_max_attempts: int = 5
     worker_reconcile_interval_seconds: float = 60.0
+    # Reclaim crashed claims (Phase 5 / audit F4)
+    work_queue_stale_seconds: int = 900
+    outbox_stale_seconds: int = 900
     # Phase 3: NEVER auto-advance to delivered / public post from outbox.
     # Kept for backward-compat reads; ignored for public publish. Staging uses
     # rendered → staged inside the render completion path instead.

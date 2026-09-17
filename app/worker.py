@@ -83,9 +83,14 @@ async def process_work_item(item: dict[str, Any]) -> None:
 
 
 async def tick(*, also_reconcile: bool = False) -> dict[str, int]:
-    """One worker cycle: claim work, process, flush outbox, optional reconcile."""
-    stats = {"claimed": 0, "processed": 0, "outbox": {}}
+    """One worker cycle: reclaim stale claims, claim work, process, flush outbox."""
+    stats: dict = {"claimed": 0, "processed": 0, "outbox": {}, "reclaimed_work": 0, "reclaimed_outbox": 0}
+    # Audit F4: always reclaim crashed running/delivering before claiming
     async with transaction() as conn:
+        rw = await queue.reclaim_stale_running(conn)
+        ro = await outbox.reclaim_stale_delivering(conn)
+        stats["reclaimed_work"] = len(rw)
+        stats["reclaimed_outbox"] = len(ro)
         items = await queue.claim_due(conn, limit=settings.worker_batch_size)
     stats["claimed"] = len(items)
     for item in items:

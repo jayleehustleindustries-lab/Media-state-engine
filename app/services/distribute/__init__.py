@@ -52,6 +52,51 @@ def _resolve_local_video(asset: dict | None) -> tuple[str | None, str | None]:
     return path, url
 
 
+
+def _existing_youtube_upload_id(meta: dict | None, captions: dict | None = None) -> str | None:
+    """Return a previously persisted YouTube video id if present (audit F3)."""
+    meta = meta or {}
+    dist = meta.get("distribution") if isinstance(meta.get("distribution"), dict) else {}
+    for key in ("youtube_upload_id", "external_id"):
+        v = meta.get(key) or (dist.get(key) if dist else None)
+        if v:
+            return str(v)
+    for r in (dist.get("results") or []):
+        if isinstance(r, dict) and r.get("platform") == "youtube" and r.get("external_id") and r.get("mode") == "live":
+            return str(r["external_id"])
+    captions = captions or meta.get("platform_captions") or {}
+    for plat in ("shorts", "youtube"):
+        cap = captions.get(plat) if isinstance(captions, dict) else None
+        if isinstance(cap, dict) and cap.get("external_id"):
+            return str(cap["external_id"])
+    return None
+
+
+async def persist_youtube_upload_id(job_id: UUID, video_id: str, extra: dict | None = None) -> None:
+    """Persist provider upload id ASAP after successful upload (before delivered)."""
+    from ...db import transaction
+
+    patch = {
+        "youtube_upload_id": video_id,
+        "distribution": {
+            "youtube_upload_id": video_id,
+            "upload_persisted": True,
+            **(extra or {}),
+        },
+    }
+    async with transaction() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb,
+                updated_at = now()
+            WHERE id = $1
+            """,
+            job_id,
+            json.dumps(patch),
+        )
+
+
 async def run_distribution(
     *,
     job_id: UUID,
@@ -86,9 +131,27 @@ async def run_distribution(
     description = yt_cap.get("caption") or script.get("full_text") or job_row.get("script_text") or ""
     tags = list(yt_cap.get("hashtags") or ["shorts", "vertical"])
 
+    existing_yt = _existing_youtube_upload_id(meta, captions)
     results: list[DistributeResult] = []
     for dist in get_distributors():
-        # Map distributor → caption key for published flags
+        # Audit F3: short-circuit YouTube if we already have an upload id
+        if dist.name == "youtube" and existing_yt:
+            privacy = (settings.youtube_privacy_status or "private").strip().lower()
+            results.append(
+                DistributeResult(
+                    platform="youtube",
+                    mode="live",
+                    public_post=(privacy == "public"),
+                    external_id=existing_yt,
+                    detail={
+                        "idempotent": True,
+                        "reason": "youtube_upload_id already persisted",
+                        "watch_url": f"https://youtu.be/{existing_yt}",
+                        "privacy_status": privacy,
+                    },
+                )
+            )
+            continue
         result = await dist.publish(
             job_id=str(job_id),
             title=title,
@@ -99,6 +162,19 @@ async def run_distribution(
             caption_meta=yt_cap if isinstance(yt_cap, dict) else {},
         )
         results.append(result)
+        # Persist upload id ASAP after successful live upload (before caller → delivered)
+        if (
+            result.platform == "youtube"
+            and result.mode == "live"
+            and result.external_id
+            and not existing_yt
+        ):
+            await persist_youtube_upload_id(
+                job_id,
+                result.external_id,
+                extra={"privacy_status": (result.detail or {}).get("privacy_status")},
+            )
+            existing_yt = result.external_id
 
     any_public = any(r.public_post and r.mode == "live" for r in results)
     any_live = any(r.mode == "live" for r in results)
@@ -153,4 +229,6 @@ __all__ = [
     "export_package",
     "run_distribution",
     "get_distributors",
+    "persist_youtube_upload_id",
+    "_existing_youtube_upload_id",
 ]

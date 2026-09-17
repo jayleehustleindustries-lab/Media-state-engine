@@ -181,3 +181,39 @@ async def flush_outbox(limit: int = 20) -> dict[str, int]:
 
     async with transaction() as conn:
         return await process_due(conn, limit=limit)
+
+
+async def reclaim_stale_delivering(
+    conn,
+    *,
+    older_than_seconds: int | None = None,
+    limit: int = 100,
+) -> list:
+    """Reset stuck ``delivering`` outbox rows to ``pending`` (audit F4)."""
+    older = int(older_than_seconds if older_than_seconds is not None else settings.outbox_stale_seconds)
+    rows = await conn.fetch(
+        """
+        WITH stale AS (
+          SELECT id FROM webhook_outbox
+          WHERE status = 'delivering'
+            AND updated_at < now() - ($1 || ' seconds')::interval
+          ORDER BY updated_at, id
+          FOR UPDATE SKIP LOCKED
+          LIMIT $2
+        )
+        UPDATE webhook_outbox o
+        SET status = 'pending',
+            next_attempt_at = now(),
+            updated_at = now(),
+            last_error = left(
+              CONCAT_WS(' | ', NULLIF(last_error, ''), 'reclaimed from stale delivering'),
+              2000
+            )
+        FROM stale WHERE o.id = stale.id
+        RETURNING o.*
+        """,
+        str(older),
+        limit,
+    )
+    return list(rows)
+

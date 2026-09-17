@@ -127,17 +127,15 @@ async def get_job_detail(job_id: UUID) -> dict | None:
 
 
 async def advance_job(job_id: UUID, to_status: str, payload: dict[str, Any]):
-    # Hard gate: never allow skipping approval into delivered
-    if to_status == 'delivered':
-        async with transaction() as conn:
-            job = await conn.fetchrow('SELECT status FROM jobs WHERE id=$1', job_id)
-            if not job:
-                raise LookupError('job not found')
-            if job['status'] != 'approved':
-                raise ValueError(
-                    f'cannot deliver from {job["status"]}: explicit approve required '
-                    f'(status must be approved before delivered / any public post)'
-                )
+    # Audit F5: generic advance must not set approved/delivered.
+    # approved → POST /jobs/{id}/approve (audit fields + optional distribute enqueue)
+    # delivered → distribute worker only (pipeline.distribute)
+    if to_status in ('approved', 'delivered'):
+        raise ValueError(
+            f'cannot advance to {to_status} via generic advance: '
+            f'use POST /jobs/{{id}}/approve for approved, and the distribute '
+            f'worker for delivered'
+        )
     async with transaction() as conn:
         return await advance(conn, job_id, to_status, payload)
 

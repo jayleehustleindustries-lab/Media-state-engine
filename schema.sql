@@ -1,3 +1,11 @@
+-- =============================================================================
+-- SCHEMA SOURCE OF TRUTH (FastAPI Media State Engine)
+-- Apply this file, then migrations/*.sql in lexical order, against the DB used
+-- by this service. Do NOT apply Drive/Supabase packs such as
+-- 001_media_state_engine_core.sql / 002_media_state_engine_auth_and_quality.sql
+-- — those are a different product/status graph and will break this app.
+-- =============================================================================
+
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS jobs (

@@ -187,3 +187,43 @@ def serialize_work(row: dict) -> dict:
         elif k == "payload" and isinstance(v, str):
             out[k] = json.loads(v)
     return out
+
+
+async def reclaim_stale_running(
+    conn,
+    *,
+    older_than_seconds: int | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Reset stuck ``running`` rows to ``pending`` after a worker crash (audit F4).
+
+    Attempts are left as-is (already incremented on claim); next claim bumps again.
+    ``next_attempt_at`` is set to now so the item is immediately claimable.
+    """
+    older = int(older_than_seconds if older_than_seconds is not None else settings.work_queue_stale_seconds)
+    rows = await conn.fetch(
+        """
+        WITH stale AS (
+          SELECT id FROM work_queue
+          WHERE status = 'running'
+            AND COALESCE(started_at, updated_at) < now() - ($1 || ' seconds')::interval
+          ORDER BY COALESCE(started_at, updated_at), id
+          FOR UPDATE SKIP LOCKED
+          LIMIT $2
+        )
+        UPDATE work_queue w
+        SET status = 'pending',
+            next_attempt_at = now(),
+            updated_at = now(),
+            last_error = left(
+              CONCAT_WS(' | ', NULLIF(last_error, ''), 'reclaimed from stale running'),
+              2000
+            )
+        FROM stale WHERE w.id = stale.id
+        RETURNING w.*
+        """,
+        str(older),
+        limit,
+    )
+    return [dict(r) for r in rows]
+

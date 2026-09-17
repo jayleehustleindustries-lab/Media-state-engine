@@ -503,6 +503,9 @@ async def distribute(job_id: UUID) -> dict:
     Always writes staging package. Calls YouTube when OAuth env is set and a
     local video file exists; otherwise staging-only (public_post=false).
     TikTok / Reels remain documented-only (captions staged, never auto-posted).
+
+    Audit F3: if already delivered, or a YouTube upload id is already persisted,
+    short-circuit success without starting another resumable upload.
     """
     from . import metrics
     from .distribute import run_distribution
@@ -511,6 +514,19 @@ async def distribute(job_id: UUID) -> dict:
         job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', job_id)
         if not job:
             raise LookupError('job not found')
+        # Idempotent success if already distributed
+        if job['status'] == 'delivered':
+            meta = _job_meta(job)
+            return {
+                'job_id': str(job_id),
+                'status': 'delivered',
+                'public_post': bool((meta.get('distribution') or {}).get('public_post')),
+                'mode': (meta.get('distribution') or {}).get('mode') or 'idempotent',
+                'staging_path': (meta.get('distribution') or {}).get('staging_path'),
+                'results': (meta.get('distribution') or {}).get('results') or [],
+                'idempotent': True,
+                'stub': False,
+            }
         if job['status'] != 'approved':
             raise ValueError(
                 f'refuse distribute: job status is {job["status"]}, expected approved '
@@ -522,6 +538,7 @@ async def distribute(job_id: UUID) -> dict:
         )
         job_dict = dict(job)
         final_dict = dict(final) if final else None
+        # YouTube idempotency: run_distribution short-circuits on persisted upload id
 
     dist = await run_distribution(job_id=job_id, job_row=job_dict, final_asset=final_dict)
 

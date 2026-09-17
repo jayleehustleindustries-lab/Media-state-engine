@@ -12,7 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..config import settings
-from ..db import transaction
+from ..db import connect, transaction
 from . import jobs, metrics, queue
 
 
@@ -65,6 +65,9 @@ async def tick(
     """Create up to ``count`` jobs for the local calendar day (cadence fill).
 
     Respects SCHEDULE_POSTS_PER_DAY unless force=True.
+
+    Audit F2: holds a day-level Postgres advisory lock across the whole tick so
+    concurrent cron/admin ticks cannot overshoot the daily cap or orphan jobs.
     """
     day = day or today_local()
     target = count if count is not None else int(settings.schedule_posts_per_day)
@@ -78,16 +81,19 @@ async def tick(
     platforms = settings.schedule_platforms_list
 
     created: list[dict[str, Any]] = []
-    skipped_reason = None
-
-    async with transaction() as conn:
-        already = await jobs_created_today(conn, day)
-        remaining = target if force else max(0, int(settings.schedule_posts_per_day) - already)
-        if count is not None and not force:
-            remaining = min(remaining, target)
-        elif count is not None and force:
-            remaining = target
-        if remaining <= 0:
+    lock_ns = 87422001
+    lock_key = int(day.toordinal())
+    db = await connect()
+    lock_conn = await db.acquire()
+    try:
+        got = await lock_conn.fetchval(
+            "SELECT pg_try_advisory_lock($1, $2)",
+            lock_ns,
+            lock_key,
+        )
+        if not got:
+            async with transaction() as conn:
+                already = await jobs_created_today(conn, day)
             return {
                 "run_date": day.isoformat(),
                 "timezone": settings.schedule_timezone,
@@ -96,69 +102,116 @@ async def tick(
                 "created": [],
                 "created_count": 0,
                 "skipped": True,
-                "reason": "daily cadence already met",
+                "reason": "another scheduler tick holds the day advisory lock",
             }
 
-        # Determine next slot numbers
-        row = await conn.fetchrow(
-            "SELECT COALESCE(max(slot), 0)::int AS m FROM schedule_runs WHERE run_date=$1",
-            day,
-        )
-        next_slot = int(row["m"]) + 1
-
-    for i in range(remaining):
-        topic = pool[(already + i) % len(pool)]
-        slot = next_slot + i
-        row = await jobs.create_job(
-            topic=topic,
-            duration_target_seconds=int(settings.schedule_duration_seconds),
-            platforms=platforms,
-            auto_script_ready=True,
-        )
-        job_id = row["id"]
-        work_id = None
-        if do_avatar:
-            work = await queue.enqueue_step(job_id, "generate_avatar", {"via": "scheduler"})
-            work_id = int(work["id"])
-
         async with transaction() as conn:
-            await conn.execute(
-                """
-                INSERT INTO schedule_runs(run_date, slot, job_id, topic, meta)
-                VALUES($1, $2, $3, $4, $5::jsonb)
-                ON CONFLICT (run_date, slot) DO NOTHING
-                """,
+            already = await jobs_created_today(conn, day)
+            remaining = target if force else max(0, int(settings.schedule_posts_per_day) - already)
+            if count is not None and not force:
+                remaining = min(remaining, target)
+            elif count is not None and force:
+                remaining = target
+            if remaining <= 0:
+                return {
+                    "run_date": day.isoformat(),
+                    "timezone": settings.schedule_timezone,
+                    "posts_per_day": int(settings.schedule_posts_per_day),
+                    "already_created_today": already,
+                    "created": [],
+                    "created_count": 0,
+                    "skipped": True,
+                    "reason": "daily cadence already met",
+                }
+
+            row = await conn.fetchrow(
+                "SELECT COALESCE(max(slot), 0)::int AS m FROM schedule_runs WHERE run_date=$1",
                 day,
-                slot,
-                job_id,
-                topic,
-                json.dumps({"enqueue_avatar": do_avatar, "work_id": work_id}),
             )
+            next_slot = int(row["m"]) + 1
 
-        await metrics.incr("jobs_created", labels={"source": "scheduler"})
-        await metrics.incr("schedule_jobs_created")
-        created.append({
-            "job_id": str(job_id),
-            "slot": slot,
-            "topic": topic,
-            "status": row["status"],
-            "avatar_work_id": work_id,
-        })
+        for i in range(remaining):
+            topic = pool[(already + i) % len(pool)]
+            slot = next_slot + i
+            # Reserve unique (run_date, slot) BEFORE create_job to avoid orphans on conflict
+            async with transaction() as conn:
+                reserved = await conn.fetchrow(
+                    """
+                    INSERT INTO schedule_runs(run_date, slot, job_id, topic, meta)
+                    VALUES($1, $2, NULL, $3, $4::jsonb)
+                    ON CONFLICT (run_date, slot) DO NOTHING
+                    RETURNING id
+                    """,
+                    day,
+                    slot,
+                    topic,
+                    json.dumps({"enqueue_avatar": do_avatar, "reserved": True}),
+                )
+            if not reserved:
+                continue
 
-    return {
-        "run_date": day.isoformat(),
-        "timezone": settings.schedule_timezone,
-        "posts_per_day": int(settings.schedule_posts_per_day),
-        "already_created_today": already,
-        "created": created,
-        "created_count": len(created),
-        "skipped": False,
-        "enqueue_avatar": do_avatar,
-        "note": (
-            "Jobs created at script_ready. Render/distribute still require worker + "
-            "explicit human approve before any public post."
-        ),
-    }
+            row = await jobs.create_job(
+                topic=topic,
+                duration_target_seconds=int(settings.schedule_duration_seconds),
+                platforms=platforms,
+                auto_script_ready=True,
+            )
+            job_id = row["id"]
+            work_id = None
+            if do_avatar:
+                work = await queue.enqueue_step(job_id, "generate_avatar", {"via": "scheduler"})
+                work_id = int(work["id"])
+
+            async with transaction() as conn:
+                await conn.execute(
+                    """
+                    UPDATE schedule_runs
+                    SET job_id = $3,
+                        topic = $4,
+                        meta = $5::jsonb
+                    WHERE run_date = $1 AND slot = $2
+                    """,
+                    day,
+                    slot,
+                    job_id,
+                    topic,
+                    json.dumps({"enqueue_avatar": do_avatar, "work_id": work_id}),
+                )
+
+            await metrics.incr("jobs_created", labels={"source": "scheduler"})
+            await metrics.incr("schedule_jobs_created")
+            created.append({
+                "job_id": str(job_id),
+                "slot": slot,
+                "topic": topic,
+                "status": row["status"],
+                "avatar_work_id": work_id,
+            })
+
+        return {
+            "run_date": day.isoformat(),
+            "timezone": settings.schedule_timezone,
+            "posts_per_day": int(settings.schedule_posts_per_day),
+            "already_created_today": already,
+            "created": created,
+            "created_count": len(created),
+            "skipped": False,
+            "enqueue_avatar": do_avatar,
+            "note": (
+                "Jobs created at script_ready. Render/distribute still require worker + "
+                "explicit human approve before any public post."
+            ),
+        }
+    finally:
+        try:
+            await lock_conn.execute(
+                "SELECT pg_advisory_unlock($1, $2)",
+                lock_ns,
+                lock_key,
+            )
+        finally:
+            await db.release(lock_conn)
+
 
 
 async def status() -> dict[str, Any]:

@@ -1,7 +1,13 @@
 [build]
 builder = "DOCKERFILE"
 
+# API service (default Dockerfile CMD = uvicorn on 8080).
+# Deploy a second Railway service from the SAME image with start command:
+#   python -m app.worker
+# Worker has no HTTP port; disable healthcheck on that service or point a
+# separate API-only service at /health.
 [deploy]
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
+startCommand = "uvicorn app.main:app --host 0.0.0.0 --port 8080"

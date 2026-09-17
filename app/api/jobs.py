@@ -108,6 +108,7 @@ async def get_work(work_id: int):
 
 @router.post('/jobs/{job_id}/advance', dependencies=[Depends(require_api_key)])
 async def advance_endpoint(job_id: UUID, request: AdvanceRequest):
+    """Generic status advance. Rejects to_status approved|delivered (use /approve + worker)."""
     try:
         return out(await jobs.advance_job(job_id, request.to_status, request.payload))
     except LookupError as exc:
@@ -197,6 +198,29 @@ async def reconcile(job_id: UUID):
 @router.post('/admin/reconcile-stuck', dependencies=[Depends(require_api_key)])
 async def reconcile_stuck(older_than_seconds: int | None = None, limit: int = 50):
     return await pipeline.reconcile_stuck(older_than_seconds=older_than_seconds, limit=limit)
+
+
+@router.post('/admin/reclaim-stale', dependencies=[Depends(require_api_key)])
+async def reclaim_stale(
+    work_older_than_seconds: int | None = None,
+    outbox_older_than_seconds: int | None = None,
+    limit: int = 100,
+):
+    """Reset stuck work_queue.running and webhook_outbox.delivering (audit F4)."""
+    from ..db import transaction
+    async with transaction() as conn:
+        work = await queue.reclaim_stale_running(
+            conn, older_than_seconds=work_older_than_seconds, limit=limit
+        )
+        boxes = await outbox.reclaim_stale_delivering(
+            conn, older_than_seconds=outbox_older_than_seconds, limit=limit
+        )
+    return {
+        "reclaimed_work": len(work),
+        "reclaimed_outbox": len(boxes),
+        "work_ids": [int(r["id"]) for r in work],
+        "outbox_ids": [int(r["id"]) for r in boxes],
+    }
 
 
 @router.post('/admin/outbox/flush', dependencies=[Depends(require_api_key)])
