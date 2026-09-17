@@ -10,6 +10,7 @@ applied in lexical order by the repository script:
 3. `supabase/migrations/20260317000003_app_adjuncts.sql`
 4. `supabase/migrations/20260317000004_image_gate.sql`
 5. `supabase/migrations/20260317000005_image_gate_caps.sql`
+6. `supabase/migrations/20260317000006_webhook_outbox_adjunct.sql`
 
 ```bash
 export DATABASE_URL=postgresql://...

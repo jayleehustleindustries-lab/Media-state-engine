@@ -55,25 +55,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_job ON events (job_id, created_at);
 
--- App outbox (SoT has webhook_deliveries with different columns)
-CREATE TABLE IF NOT EXISTS webhook_outbox (
-  id bigserial PRIMARY KEY,
-  job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-  destination_url text NOT NULL,
-  payload jsonb NOT NULL,
-  status text NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','delivering','delivered','dead')),
-  attempts int NOT NULL DEFAULT 0,
-  max_attempts int NOT NULL DEFAULT 8,
-  next_attempt_at timestamptz NOT NULL DEFAULT now(),
-  last_error text,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  delivered_at timestamptz
-);
-CREATE INDEX IF NOT EXISTS idx_outbox_pending ON webhook_outbox (status, next_attempt_at)
-  WHERE status IN ('pending', 'delivering');
-
+-- webhook_outbox now comes from supabase/migrations/20260317000006_webhook_outbox_adjunct.sql (deploy SoT / #18).
 
 -- Approve metadata used by app.services.jobs.approve_job
 ALTER TABLE jobs
