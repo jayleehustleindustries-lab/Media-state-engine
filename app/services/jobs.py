@@ -6,6 +6,24 @@ from ..state_machine import advance
 from ..config import settings
 
 
+def _serialize_row(row) -> dict:
+    if row is None:
+        return None
+    out = dict(row)
+    for k, v in list(out.items()):
+        if hasattr(v, "isoformat"):
+            out[k] = v.isoformat()
+        elif k in ("id", "job_id") and v is not None:
+            out[k] = str(v)
+        elif k == "meta" and isinstance(v, str):
+            out[k] = json.loads(v)
+        elif k == "payload" and isinstance(v, str):
+            out[k] = json.loads(v)
+        elif k == "result" and isinstance(v, str):
+            out[k] = json.loads(v)
+    return out
+
+
 async def create_job(script_text: str):
     async with transaction() as conn:
         return await conn.fetchrow('INSERT INTO jobs(script_text) VALUES($1) RETURNING *', script_text)
@@ -14,6 +32,45 @@ async def create_job(script_text: str):
 async def get_job(job_id: UUID):
     async with transaction() as conn:
         return await conn.fetchrow('SELECT * FROM jobs WHERE id=$1', job_id)
+
+
+async def get_job_detail(job_id: UUID) -> dict | None:
+    """Job row plus assets, events (status history), and work_queue items."""
+    async with transaction() as conn:
+        job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1', job_id)
+        if not job:
+            return None
+        assets = await conn.fetch(
+            'SELECT * FROM assets WHERE job_id=$1 ORDER BY created_at, id', job_id
+        )
+        events = await conn.fetch(
+            'SELECT * FROM events WHERE job_id=$1 ORDER BY created_at, id', job_id
+        )
+        work = await conn.fetch(
+            'SELECT * FROM work_queue WHERE job_id=$1 ORDER BY created_at, id', job_id
+        )
+        outbox_rows = await conn.fetch(
+            'SELECT * FROM webhook_outbox WHERE job_id=$1 ORDER BY created_at, id', job_id
+        )
+    status_history = [
+        {
+            'from_status': e['from_status'],
+            'to_status': e['to_status'],
+            'payload': e['payload'] if not isinstance(e['payload'], str) else json.loads(e['payload']),
+            'created_at': e['created_at'].isoformat() if hasattr(e['created_at'], 'isoformat') else e['created_at'],
+            'event_id': e['id'],
+        }
+        for e in events
+    ]
+    return {
+        'job': _serialize_row(job),
+        'status': job['status'],
+        'assets': [_serialize_row(a) for a in assets],
+        'events': [_serialize_row(e) for e in events],
+        'status_history': status_history,
+        'work': [_serialize_row(w) for w in work],
+        'outbox': [_serialize_row(o) for o in outbox_rows],
+    }
 
 
 async def advance_job(job_id: UUID, to_status: str, payload: dict[str, Any]):

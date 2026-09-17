@@ -48,3 +48,23 @@ Railway can build from the included `Dockerfile` and use `railway.toml` for `/he
 Authenticated API access is required for job routes. Set `MEDIA_ENGINE_API_KEY` or `API_KEY` and send `Authorization: Bearer …` or `X-API-Key`. Health and `/webhooks/*` stay public; provider webhooks verify HMAC secrets (`HEYGEN_WEBHOOK_SECRET`, `ELEVENLABS_WEBHOOK_SECRET`, `REMOTION_WEBHOOK_SECRET`).
 
 Outbound delivery uses a durable `webhook_outbox` with exponential backoff and dead-letter after N attempts. Stuck HeyGen jobs can be reconciled with `POST /jobs/{id}/reconcile` or `POST /admin/reconcile-stuck`. See `PHASE1_REPORT.md`.
+
+## Phase 2 — background worker + pipeline
+
+Provider I/O (ElevenLabs, HeyGen, Remotion) runs on a **Postgres `work_queue` worker**, not in the API process.
+
+```bash
+# API (enqueues work, returns 202)
+uvicorn app.main:app --reload
+
+# Worker (claims work_queue + flushes outbox)
+python -m app.worker
+```
+
+- `POST /jobs/{id}/generate-audio|generate-avatar|render` → **202** `{work_id, step, queued}`
+- `GET /jobs/{id}/detail` → assets, events, status history, work items, outbox
+- HeyGen **Direct Video** (`POST /v3/videos`) with `callback_url` + `Idempotency-Key`
+- Phase 1 reconcile remains for missed webhooks
+- Outbox success can auto-advance `rendered → delivered`
+
+See `PHASE2_REPORT.md` for queue choice, env vars, and stress-test notes.

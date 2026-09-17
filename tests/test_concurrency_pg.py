@@ -27,7 +27,7 @@ async def pg_pool(require_database_url):
     async with pool.acquire() as conn:
         await _apply_schema(conn)
         # Clean tables for isolation
-        await conn.execute('TRUNCATE webhook_outbox, idempotency_keys, events, assets, jobs CASCADE')
+        await conn.execute('TRUNCATE work_queue, webhook_outbox, idempotency_keys, events, assets, jobs CASCADE')
     dbmod._pool = pool
     yield pool
     await pool.close()

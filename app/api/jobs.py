@@ -3,18 +3,37 @@ import hashlib
 import hmac
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 
 from ..auth import require_api_key
 from ..config import settings
 from ..models import JobCreate, AdvanceRequest, AssetCreate, AudioWebhook, RenderWebhook
-from ..services import jobs, pipeline, heygen, outbox
+from ..services import jobs, pipeline, heygen, outbox, queue
 from ..state_machine import IllegalTransition
 
 router = APIRouter()
 
 
+
 def out(row):
     return dict(row) if row else None
+
+
+def _queued(work: dict) -> dict:
+    return {
+        'work_id': int(work['id']),
+        'job_id': str(work['job_id']),
+        'step': work['step'],
+        'status': work['status'],
+        'job_status': work.get('job_status'),
+        'attempts': int(work.get('attempts') or 0),
+        'queued': work['status'] in ('pending', 'running'),
+    }
+
+
+class AvatarEnqueueBody(BaseModel):
+    avatar_id: str | None = None
+    voice_id: str | None = None
 
 
 def _verify_inbound_hmac(raw_body: bytes, signature: str | None, secret: str, name: str) -> None:
@@ -44,6 +63,24 @@ async def get(job_id: UUID):
     return out(row)
 
 
+
+@router.get('/jobs/{job_id}/detail', dependencies=[Depends(require_api_key)])
+async def detail(job_id: UUID):
+    """Full job detail: assets, events, status history, work queue, outbox."""
+    data = await jobs.get_job_detail(job_id)
+    if not data:
+        raise HTTPException(404, 'job not found')
+    return data
+
+
+@router.get('/work/{work_id}', dependencies=[Depends(require_api_key)])
+async def get_work(work_id: int):
+    row = await queue.get_work(work_id)
+    if not row:
+        raise HTTPException(404, 'work item not found')
+    return queue.serialize_work(row)
+
+
 @router.post('/jobs/{job_id}/advance', dependencies=[Depends(require_api_key)])
 async def advance_endpoint(job_id: UUID, request: AdvanceRequest):
     try:
@@ -62,34 +99,40 @@ async def asset(job_id: UUID, request: AssetCreate):
         raise HTTPException(409, str(exc))
 
 
-@router.post('/jobs/{job_id}/generate-audio', dependencies=[Depends(require_api_key)])
+@router.post('/jobs/{job_id}/generate-audio', status_code=202, dependencies=[Depends(require_api_key)])
 async def audio(job_id: UUID):
+    """Enqueue ElevenLabs audio generation; returns immediately with work_id."""
     try:
-        return await pipeline.generate_audio(job_id)
+        work = await queue.enqueue_step(job_id, 'generate_audio')
     except LookupError as exc:
         raise HTTPException(404, str(exc))
-    except (IllegalTransition, RuntimeError) as exc:
-        raise HTTPException(409, str(exc))
+    return _queued(work)
 
 
-@router.post('/jobs/{job_id}/render', dependencies=[Depends(require_api_key)])
+@router.post('/jobs/{job_id}/render', status_code=202, dependencies=[Depends(require_api_key)])
 async def render(job_id: UUID):
+    """Enqueue Remotion render; returns immediately with work_id."""
     try:
-        return await pipeline.render(job_id)
+        work = await queue.enqueue_step(job_id, 'render')
     except LookupError as exc:
         raise HTTPException(404, str(exc))
-    except (IllegalTransition, RuntimeError) as exc:
-        raise HTTPException(409, str(exc))
+    return _queued(work)
 
 
-@router.post('/jobs/{job_id}/generate-avatar', dependencies=[Depends(require_api_key)])
-async def avatar(job_id: UUID):
+@router.post('/jobs/{job_id}/generate-avatar', status_code=202, dependencies=[Depends(require_api_key)])
+async def avatar(job_id: UUID, body: AvatarEnqueueBody | None = None):
+    """Enqueue HeyGen Direct Video; completion via callback_url webhook (or reconcile)."""
+    payload = {}
+    if body:
+        if body.avatar_id:
+            payload['avatar_id'] = body.avatar_id
+        if body.voice_id:
+            payload['voice_id'] = body.voice_id
     try:
-        return await pipeline.generate_avatar(job_id)
+        work = await queue.enqueue_step(job_id, 'generate_avatar', payload)
     except LookupError as exc:
         raise HTTPException(404, str(exc))
-    except (IllegalTransition, RuntimeError, heygen.HeyGenError) as exc:
-        raise HTTPException(409, str(exc))
+    return _queued(work)
 
 
 @router.post('/jobs/{job_id}/reconcile', dependencies=[Depends(require_api_key)])
@@ -111,6 +154,13 @@ async def reconcile_stuck(older_than_seconds: int | None = None, limit: int = 50
 @router.post('/admin/outbox/flush', dependencies=[Depends(require_api_key)])
 async def flush_outbox(limit: int = 20):
     return await outbox.flush_outbox(limit=limit)
+
+
+@router.post('/admin/worker/tick', dependencies=[Depends(require_api_key)])
+async def worker_tick(also_reconcile: bool = False):
+    """Run one worker cycle in-process (tests / single-box ops without a separate process)."""
+    from ..worker import tick
+    return await tick(also_reconcile=also_reconcile)
 
 
 @router.post('/webhooks/elevenlabs')
