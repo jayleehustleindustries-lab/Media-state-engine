@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql://postgres:postgres@localhost:5432/media_state"
+    database_url: str = "postgresql:///media_state"
 
     # API auth — either name works; MEDIA_ENGINE_API_KEY takes precedence if both set
     api_key: str = ""
@@ -75,6 +75,21 @@ class Settings(BaseSettings):
     youtube_refresh_token: str = ""
     # private | unlisted | public — default private so even live uploads are not public
     youtube_privacy_status: str = "private"
+
+    # --- Image quality gate (hard, fail-closed) ---
+    image_gate_max_attempts: int = 3
+    image_gate_fail_closed: bool = True
+    image_gate_break_glass: bool = False
+    image_scorer_provider: str = "gemini"  # gemini | grok | mock
+    image_scorer_gemini_api_key: str = ""
+    gemini_api_key: str = ""
+    image_scorer_gemini_model: str = "gemini-2.0-flash"
+    image_scorer_grok_api_key: str = ""
+    xai_api_key: str = ""
+    image_scorer_grok_model: str = "grok-2-vision-1212"
+    image_scorer_timeout_seconds: float = 60.0
+    image_scorer_daily_budget: int = 200
+    active_reference_set_path: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

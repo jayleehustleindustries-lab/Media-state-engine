@@ -12,6 +12,8 @@ from uuid import UUID
 from ..config import settings
 
 STEPS = frozenset({
+    "score_image",
+    "revise_image",
     "generate_audio",
     "generate_avatar",
     "render",

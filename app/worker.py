@@ -51,7 +51,26 @@ async def process_work_item(item: dict[str, Any]) -> None:
     log.info("processing work_id=%s job_id=%s step=%s attempt=%s", work_id, job_id, step, attempts)
     try:
         result: Any
-        if step == "generate_audio":
+        if step == "score_image":
+            from .services.image_gate import run_score_image_step
+            async with transaction() as conn:
+                result = await run_score_image_step(
+                    conn,
+                    job_id,
+                    candidate_url=payload.get("candidate_url") or "",
+                    prompt=payload.get("prompt") or "",
+                )
+        elif step == "revise_image":
+            from .services.image_gate import run_revise_image_step
+            async def _regen(jid, prompt, refs):
+                return {
+                    "url": payload.get("revised_url")
+                    or payload.get("candidate_url")
+                    or "mock://revised"
+                }
+            async with transaction() as conn:
+                result = await run_revise_image_step(conn, job_id, regenerate=_regen)
+        elif step == "generate_audio":
             result = await pipeline.generate_audio(job_id)
         elif step == "generate_avatar":
             result = await pipeline.generate_avatar(

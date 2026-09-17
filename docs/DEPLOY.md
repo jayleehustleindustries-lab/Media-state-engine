@@ -1,3 +1,24 @@
+# Deploy
+
+## Schema source of truth (CRITICAL)
+
+Apply **in order**:
+
+1. `supabase/migrations/20260317000001_media_state_engine_core.sql`
+2. `supabase/migrations/20260317000002_media_state_engine_auth_and_quality.sql`
+3. `supabase/migrations/20260317000003_app_adjuncts.sql`
+4. `supabase/migrations/20260317000004_image_gate.sql`
+
+```bash
+export DATABASE_URL=postgresql://...
+./scripts/apply_migrations.sh
+```
+
+Legacy `schema.sql` + `migrations/00x_phase*.sql` are **LEGACY** — do not apply to new environments.
+Approval gate remains sacred: **publish only via `approved → published`**.
+Image gate is mandatory before HeyGen: **`assert_image_pass_for_heygen` in same txn as key reserve**.
+
+
 # Deploy — Media State Engine (FastAPI)
 
 ## Schema source of truth (critical)

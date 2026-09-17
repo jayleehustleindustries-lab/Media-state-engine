@@ -1,6 +1,7 @@
 from uuid import UUID
 import json
 from . import elevenlabs, remotion, heygen, jobs, webhooks, outbox
+from .image_gate import assert_pass_for_heygen, GateRefuse
 from ..db import transaction
 from ..state_machine import advance, IllegalTransition
 from ..config import settings
@@ -190,12 +191,20 @@ async def generate_avatar(job_id: UUID, avatar_id: str | None = None, voice_id: 
                 'UPDATE jobs SET meta=$2::jsonb, updated_at=now() WHERE id=$1',
                 job_id, json.dumps(meta),
             )
+        # IMAGE GATE: refuse HeyGen unless pass score bound to current ref hash
+        # (same transaction as idempotency reserve — no TOCTOU)
+        try:
+            gate_score = await assert_pass_for_heygen(conn, job_id)
+        except GateRefuse:
+            raise
         await jobs.reserve_key(conn, key, job_id, 'heygen-avatar')
         await advance(conn, job_id, 'rendering', {
             'provider': 'heygen',
             'idempotency_key': key,
             'aspect': '9:16',
             'horizontal_paid': paid_dual,
+            'image_score_id': str(gate_score.get('id') or gate_score.get('image_score_id') or ''),
+            'image_gate': 'pass',
         })
     script_text = _job_script_text(job)
     try:
