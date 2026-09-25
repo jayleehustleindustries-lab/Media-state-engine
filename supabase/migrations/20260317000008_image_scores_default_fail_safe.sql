@@ -1,0 +1,23 @@
+-- Fix fail-open default on image_scores.likeness_approval_status.
+--
+-- 20260317000004_image_gate.sql created this column as:
+--   likeness_approval_status text not null default 'approved'
+--
+-- The one real insert path (app/services/image_gate/gate.py record_score) always
+-- passes an explicit value sourced from the locked reference-set manifest, so this
+-- default is never actually relied on today. But it is still a landmine: any future
+-- insert into image_scores that omits the column (a backfill, an admin/debug script,
+-- a different code path) would silently be recorded as already-approved.
+--
+-- app/services/image_gate/refs.py (load_active_reference_set) treats ONLY the
+-- literal string 'approved' as acceptable:
+--     status = (data.get("likeness_approval_status") or "").lower()
+--     if status != "approved":
+--         raise ReferenceSetError(...)
+--
+-- so the new default must not be 'approved' (or anything that would pass that
+-- check). 'pending' fails safe: it reads as not-yet-approved everywhere the value
+-- is consulted, and any code path that truly means to record an approved score
+-- must say so explicitly.
+alter table image_scores
+  alter column likeness_approval_status set default 'pending';
