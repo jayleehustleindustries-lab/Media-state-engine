@@ -117,18 +117,30 @@ async def advance_endpoint(job_id: UUID, request: AdvanceRequest):
         raise HTTPException(409, str(exc))
 
 
-@router.post('/jobs/{job_id}/approve', dependencies=[Depends(require_api_key)])
-async def approve_endpoint(job_id: UUID, body: ApproveRequest | None = None):
+@router.post('/jobs/{job_id}/approve')
+async def approve_endpoint(
+    job_id: UUID,
+    body: ApproveRequest | None = None,
+    presented_key: str = Depends(require_api_key),
+):
     """Explicit human approval gate. Required before any distribution.
 
-    Flips staged → approved and may enqueue distribute.
+    Flips staged/review → approved and may enqueue distribute.
     YouTube may go live only when OAuth env is set; TikTok/Reels never auto-post.
+
+    `approved_by` (the actor of record) is derived server-side from the
+    credential that was actually required to authenticate this request,
+    not from `body.approved_by` — a client-supplied JSON field could
+    previously claim any identity string with zero verification. See
+    app/services/identity.py and app/services/jobs.py::approve_job.
+    `body.approved_by`, if sent, is accepted for backward compatibility
+    but is no longer authoritative.
     """
     body = body or ApproveRequest()
     try:
         return await jobs.approve_job(
             job_id,
-            approved_by=body.approved_by,
+            approved_by_key=presented_key,
             enqueue_distribute=body.enqueue_distribute,
             note=body.note,
         )

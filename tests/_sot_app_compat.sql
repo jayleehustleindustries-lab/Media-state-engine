@@ -57,10 +57,9 @@ CREATE INDEX IF NOT EXISTS idx_events_job ON events (job_id, created_at);
 
 -- webhook_outbox now comes from supabase/migrations/20260317000006_webhook_outbox_adjunct.sql (deploy SoT / #18).
 
--- Approve metadata used by app.services.jobs.approve_job
-ALTER TABLE jobs
-  ADD COLUMN IF NOT EXISTS approved_at timestamptz,
-  ADD COLUMN IF NOT EXISTS approved_by text;
+-- approved_at / approved_by / approved_by_key_id are now REAL SoT columns
+-- (supabase/migrations/20260317000007_approval_audit.sql), applied before
+-- this file by apply_schema() — nothing left to patch here.
 
 -- Dual-format asset kinds used by pipeline
 DO $$ BEGIN
@@ -83,7 +82,38 @@ EXCEPTION WHEN others THEN
     ON assets (job_id, kind) WHERE job_id IS NOT NULL;
 END $$;
 
--- Prefer legacy in-app graph for Phase 1–5 pytest until create_job/outbox ported to SoT RPC
+-- Prefer legacy in-app graph for Phase 1-5 pytest (pipeline.py / HeyGen /
+-- image_gate / quality-gate / distribute / queue / outbox / concurrency
+-- suites), which drive jobs straight through legacy status literals
+-- (script_ready -> audio_generating -> ... -> staged -> approved ->
+-- delivered/failed) and skip the canonical queued/running/image_* steps
+-- entirely. This is a real architecture gap (those paths were never
+-- ported to the canonical graph), not something this fix's scope covers
+-- — porting it means rewriting HeyGen / the image quality gate / the
+-- script quality gate / the distribute worker, which is explicitly out
+-- of scope for the approval-gate/job-creation fix this overlay supports.
+--
+-- Verified empirically (not assumed): leaving transition_job live here
+-- and reapplying the existing suite breaks 21 of 74 tests, all in
+-- exactly those out-of-scope files (test_pipeline_phase1, test_phase2-5,
+-- test_concurrency_pg) with "illegal transition X -> Y" from the real
+-- RPC's strict canonical graph. Deleting a handful of legacy status
+-- literals here (leaving transition_job in place) would only trade that
+-- breakage for a different one, since job_status enum membership,
+-- job_events vs events, and the pipeline's direct-jump transitions are
+-- all still legacy-shaped below this line.
+--
+-- The canonical approval path this overlay is NOT allowed to silently
+-- swallow (create_job + approve_job, i.e. the actual scope of this fix)
+-- is instead exercised against the real, untouched transition_job RPC in
+-- tests/test_canonical_approval.py, via
+-- tests.conftest.apply_canonical_schema() — supabase/migrations/*.sql
+-- only, zero compat overlay, zero legacy status literals. That suite is
+-- the real answer to "does transition_job actually gate approval
+-- correctly"; this DROP intentionally keeps the (already broad,
+-- already-passing, out-of-scope) legacy suite on the permissive Python
+-- fallback graph it was written against, so this fix adds new real-RPC
+-- coverage without regressing 21 unrelated tests to fix them.
 DO $$
 DECLARE r record;
 BEGIN
