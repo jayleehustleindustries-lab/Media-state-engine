@@ -1,8 +1,10 @@
 """Vision scorers: Gemini primary, Grok Imagine fallback. Fail closed on errors."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import mimetypes
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -122,6 +124,51 @@ def _extract_json(text: str) -> dict[str, Any]:
         return json.loads(m.group(0))
 
 
+def _guess_image_mime(name_or_url: str, content_type: str | None = None) -> str:
+    """Best-effort image MIME type from a response Content-Type header or filename/URL."""
+    if content_type:
+        ct = content_type.split(";")[0].strip().lower()
+        if ct.startswith("image/"):
+            return ct
+    guessed, _ = mimetypes.guess_type(name_or_url)
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    return "image/jpeg"
+
+
+def _read_hero_bytes(refs: ActiveReferenceSet) -> tuple[bytes, str]:
+    """Read the locked hero identity reference image off disk as real bytes."""
+    path = refs.hero.path
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ScorerError(f"failed to read hero reference image {path}: {exc}") from exc
+    if not data:
+        raise ScorerError(f"hero reference image is empty: {path}")
+    return data, _guess_image_mime(str(path))
+
+
+async def _fetch_candidate_bytes(client: Any, candidate_url: str) -> tuple[bytes, str]:
+    """Download the candidate image's real bytes so the vision model can actually see it.
+
+    candidate_url may be a signed/authenticated URL this app's own network can reach but a
+    third-party vision API's servers cannot — so we always fetch the bytes ourselves here
+    and attach them inline, rather than handing the bare URL to the provider.
+    """
+    try:
+        resp = await client.get(candidate_url)
+    except Exception as exc:  # noqa: BLE001 - any transport failure must fail closed
+        raise ScorerError(f"failed to fetch candidate image {candidate_url}: {exc}") from exc
+    status = getattr(resp, "status_code", 200)
+    if status >= 400:
+        raise ScorerError(f"candidate image fetch HTTP {status}: {candidate_url}")
+    data = resp.content
+    if not data:
+        raise ScorerError(f"candidate image fetch returned empty body: {candidate_url}")
+    mime = _guess_image_mime(candidate_url, resp.headers.get("content-type") if resp.headers else None)
+    return data, mime
+
+
 async def _score_gemini(candidate_url: str, refs: ActiveReferenceSet, prompt: str) -> ScoreCard:
     api_key = (settings.image_scorer_gemini_api_key or settings.gemini_api_key or "").strip()
     if not api_key:
@@ -142,27 +189,44 @@ async def _score_gemini(candidate_url: str, refs: ActiveReferenceSet, prompt: st
         "text_legibility,brand_fit,no_artifacts,identity_likeness,overall,"
         "identity_drift,failure_reasons."
     )
-    # Use Gemini generateContent; pass candidate URL + hero hash context in text
-    # (bytes upload optional; URL/path referenced in prompt for stubbed providers)
+    hero_bytes, hero_mime = _read_hero_bytes(refs)
+
     model = settings.image_scorer_gemini_model
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={api_key}"
     )
-    body = {
-        "contents": [{
-            "parts": [{
-                "text": (
-                    f"{system}\n\nHERO_SHA256={refs.hero.sha256}\n"
-                    f"HERO_PATH={refs.hero.path}\nCANDIDATE={candidate_url}\n"
-                    f"PROMPT={prompt}\n"
-                    "Score now."
-                )
-            }]
-        }],
-        "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
-    }
     async with httpx.AsyncClient(timeout=settings.image_scorer_timeout_seconds) as client:
+        # candidate_url may be a signed/app-internal URL that Google's servers cannot
+        # reach, so we fetch its real bytes ourselves rather than passing a file_data URL.
+        candidate_bytes, candidate_mime = await _fetch_candidate_bytes(client, candidate_url)
+        body = {
+            "contents": [{
+                "parts": [
+                    {
+                        "text": (
+                            f"{system}\n\nHERO_SHA256={refs.hero.sha256}\n"
+                            f"PROMPT={prompt}\n"
+                            "The HERO identity reference image is attached first, followed "
+                            "by the CANDIDATE image to score.\nScore now."
+                        )
+                    },
+                    {
+                        "inline_data": {
+                            "mime_type": hero_mime,
+                            "data": base64.b64encode(hero_bytes).decode("ascii"),
+                        }
+                    },
+                    {
+                        "inline_data": {
+                            "mime_type": candidate_mime,
+                            "data": base64.b64encode(candidate_bytes).decode("ascii"),
+                        }
+                    },
+                ]
+            }],
+            "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+        }
         resp = await client.post(url, json=body)
         if resp.status_code >= 400:
             raise ScorerError(f"gemini HTTP {resp.status_code}: {resp.text[:300]}")
@@ -179,20 +243,42 @@ async def _score_grok(candidate_url: str, refs: ActiveReferenceSet, prompt: str)
     if not api_key:
         raise ScorerError("GROK/xAI API key not configured")
     import httpx
-    body = {
-        "model": settings.image_scorer_grok_model,
-        "messages": [{
-            "role": "user",
-            "content": (
-                "Score avatar likeness 0-10 JSON axes "
-                "face_consistency,lighting,composition,text_legibility,brand_fit,"
-                "no_artifacts,identity_likeness,overall,identity_drift,failure_reasons. "
-                f"HERO_SHA={refs.hero.sha256} CANDIDATE={candidate_url} PROMPT={prompt}"
-            ),
-        }],
-        "temperature": 0.1,
-    }
+
+    hero_bytes, hero_mime = _read_hero_bytes(refs)
+
     async with httpx.AsyncClient(timeout=settings.image_scorer_timeout_seconds) as client:
+        # xAI's chat completions API is OpenAI-vision-compatible: image content parts are
+        # {"type": "image_url", "image_url": {"url": ...}}, where url accepts either an
+        # http(s) URL or a base64 data URI. candidate_url may not be reachable from xAI's
+        # servers (signed/app-internal), so we fetch bytes ourselves and send data URIs
+        # for both images rather than trusting either URL to be externally fetchable.
+        candidate_bytes, candidate_mime = await _fetch_candidate_bytes(client, candidate_url)
+        hero_data_uri = f"data:{hero_mime};base64,{base64.b64encode(hero_bytes).decode('ascii')}"
+        candidate_data_uri = (
+            f"data:{candidate_mime};base64,{base64.b64encode(candidate_bytes).decode('ascii')}"
+        )
+        body = {
+            "model": settings.image_scorer_grok_model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Score avatar likeness 0-10 JSON axes "
+                            "face_consistency,lighting,composition,text_legibility,brand_fit,"
+                            "no_artifacts,identity_likeness,overall,identity_drift,failure_reasons. "
+                            f"HERO_SHA={refs.hero.sha256} PROMPT={prompt} "
+                            "The first attached image is the HERO identity reference. The "
+                            "second attached image is the CANDIDATE to score."
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": hero_data_uri}},
+                    {"type": "image_url", "image_url": {"url": candidate_data_uri}},
+                ],
+            }],
+            "temperature": 0.1,
+        }
         resp = await client.post(
             "https://api.x.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
