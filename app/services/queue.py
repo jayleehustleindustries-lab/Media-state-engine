@@ -17,6 +17,8 @@ STEPS = frozenset({
     "generate_audio",
     "generate_avatar",
     "render",
+    "generate_vertex_clips",
+    "render_vertex",
     "reconcile",
     "flush_outbox",
     "distribute",

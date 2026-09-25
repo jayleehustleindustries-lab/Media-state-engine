@@ -91,6 +91,12 @@ async def process_work_item(item: dict[str, Any]) -> None:
             )
         elif step == "render":
             result = await pipeline.render(job_id)
+        elif step == "generate_vertex_clips":
+            result = await pipeline.generate_vertex_clips(
+                job_id, reference_images=payload.get("reference_images"),
+            )
+        elif step == "render_vertex":
+            result = await pipeline.render_vertex(job_id)
         elif step == "reconcile":
             result = await pipeline.reconcile_job(job_id)
         elif step == "flush_outbox":

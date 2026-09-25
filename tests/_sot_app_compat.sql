@@ -70,6 +70,16 @@ DO $$ BEGIN
   ALTER TYPE asset_kind ADD VALUE IF NOT EXISTS 'final_h';
 EXCEPTION WHEN others THEN NULL; END $$;
 
+-- Vertex clip-generation asset kind (one row per job holding all 3 Veo
+-- clip LRO handles in meta.clips; see pipeline.generate_vertex_clips).
+-- Same test-only-overlay gap as video_h/final_h above: not yet in
+-- supabase/migrations, so this only works under this compat schema, not a
+-- pure-migrations canonical DB. Flagged in the branch report as a
+-- fast-follow migration candidate, matching the pre-existing gap.
+DO $$ BEGIN
+  ALTER TYPE asset_kind ADD VALUE IF NOT EXISTS 'video_clip';
+EXCEPTION WHEN others THEN NULL; END $$;
+
 -- Unique needed by pipeline ON CONFLICT (job_id, kind)
 DO $$ BEGIN
   IF NOT EXISTS (

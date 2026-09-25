@@ -26,6 +26,29 @@ class Settings(BaseSettings):
     remotion_render_url: str = ""
     remotion_webhook_secret: str = ""
 
+    # --- Vertex AI (Veo) video generation ---
+    # Auth is OAuth2 (Application Default Credentials / service account), NOT
+    # a static API key — unlike every other provider in this file. Set either
+    # GOOGLE_APPLICATION_CREDENTIALS (path to a service-account JSON key) or
+    # VERTEX_SERVICE_ACCOUNT_JSON (the key inline, e.g. from a secret store);
+    # if neither is set, google-auth falls back to ambient ADC (gcloud login,
+    # GCE/Cloud Run metadata server, etc.) when available.
+    vertex_project_id: str = ""
+    vertex_location: str = "us-central1"
+    # Confirmed against google-genai SDK v2.25.0 test fixtures (docs.cloud.google.com
+    # was unreachable from this environment); pin/override per your project's GA access.
+    vertex_model_id: str = "veo-3.0-generate-001"
+    vertex_aspect_ratio: str = "9:16"
+    vertex_clip_duration_seconds: int = 8
+    google_application_credentials: str = ""
+    vertex_service_account_json: str = ""
+
+    # --- ffmpeg local render (stitch + burned-in captions) ---
+    # No API key — config check verifies the ffmpeg binary is findable instead.
+    # Empty = auto-detect: PATH, then the imageio-ffmpeg pip package.
+    ffmpeg_bin_path: str = ""
+    ffmpeg_caption_font_path: str = ""
+
     webhook_url: str = ""
     webhook_secret: str = ""
 

@@ -1,6 +1,7 @@
 from uuid import UUID
+import base64
 import json
-from . import elevenlabs, remotion, heygen, jobs, webhooks, outbox
+from . import elevenlabs, remotion, heygen, vertex, ffmpeg_render, jobs, webhooks, outbox, storage
 from .image_gate import assert_pass_for_heygen, GateRefuse
 from ..db import transaction
 from ..state_machine import advance, IllegalTransition
@@ -24,6 +25,27 @@ def _job_meta(job) -> dict:
     if isinstance(meta, str):
         meta = json.loads(meta)
     return dict(meta or {})
+
+
+def _job_script_dict(job) -> dict:
+    """Structured hook/body/cta script (see scriptgen.compose_script), if present."""
+    script = job.get('script') if hasattr(job, 'get') else job['script'] if 'script' in job.keys() else None
+    if isinstance(script, str):
+        script = json.loads(script)
+    return dict(script or {})
+
+
+def _decode_result(value):
+    """asyncpg returns jsonb columns as raw str (no codec registered on this
+    pool) — decode before treating an idempotency key's stored ``result`` as
+    a dict. Needed anywhere a replayed key's result is read back (this repo's
+    other provider steps read ``existing['result']`` directly and happen to
+    only be exercised via single-call tests, so this was previously latent;
+    the vertex 3-clip path retries per-clip on every call, so it surfaces
+    here for real)."""
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
 
 
 async def _fail_step(conn, job_id: UUID, key: str, payload: dict):
@@ -532,6 +554,293 @@ async def complete_heygen_webhook(event_type: str, video_id: str, event_data: di
     return response
 
 
+# ---------------------------------------------------------------------------
+# Vertex AI (Veo) + ffmpeg flow
+#
+# Replaces HeyGen + Remotion for this provider pair. Structural differences
+# from the HeyGen/Remotion flow above, both intentional (see vertex.py /
+# ffmpeg_render.py module docstrings for why):
+#   - THREE clip-generation calls per job (hook / core-lift / resolution),
+#     each with its own idempotency key f'{job_id}:vertex-clip-{i}',
+#     reserved the same same-transaction-as-state-advance way heygen's key
+#     is reserved above (see jobs.reserve_key).
+#   - No separate audio/TTS step: voice is baked into (or absent from) the
+#     Veo clip itself, so tts_queued/tts_running are simply skipped rather
+#     than forced — this flow goes straight from script_ready to rendering.
+#   - No webhook: completion is polling-only, so reconcile_vertex_clips is
+#     the ONLY path a clip's completion is ever observed on (not a stuck-job
+#     fallback like reconcile_job is for HeyGen).
+#   - State-graph note (intentionally NOT solved here — flagged for a
+#     fast-follow): this reuses the existing legacy 'rendering' status for
+#     BOTH "3 Veo clips in flight" and "ffmpeg stitching" rather than adding
+#     dedicated states (e.g. clip_generating / stitching). That is the
+#     simplest thing that works with the existing state machine and keeps
+#     this job model's one-status-per-phase assumption intact; a schema
+#     migration adding explicit per-clip states would be cleaner if this
+#     provider pair becomes the primary path.
+# ---------------------------------------------------------------------------
+
+def _vertex_clip_prompts(job) -> list[str]:
+    """Hook / core-lift / resolution prompts for the 3 Veo clips.
+
+    Prefers the structured script (scriptgen.compose_script's hook/body/cta)
+    when present; falls back to the full script text for all three so a job
+    created without structured fields still produces 3 (identical-prompt)
+    clips rather than failing outright.
+    """
+    script = _job_script_dict(job)
+    full_text = _job_script_text(job)
+    hook = (script.get('hook') or full_text or '').strip()
+    body = (script.get('body') or full_text or '').strip()
+    cta = (script.get('cta') or full_text or '').strip()
+    return [hook, body, cta]
+
+
+async def generate_vertex_clips(job_id: UUID, reference_images: list[dict] | None = None) -> dict:
+    """Start all 3 Vertex Veo clip generations. Vertex-flow analog of
+    generate_avatar; completion arrives only through reconcile_vertex_clips
+    (no webhook — see module note above).
+    """
+    key = f'{job_id}:vertex-clips'
+    async with transaction() as conn:
+        existing = await jobs.get_key(conn, key)
+        if existing:
+            return _decode_result(existing['result']) or {'status': 'in_progress', 'idempotency_key': key}
+        job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', job_id)
+        if not job:
+            raise LookupError('job not found')
+        # IMAGE GATE: same fail-closed guard generate_avatar uses, same
+        # transaction as the idempotency reserve (no TOCTOU).
+        try:
+            gate_score = await assert_pass_for_heygen(conn, job_id)
+        except GateRefuse:
+            raise
+        await jobs.reserve_key(conn, key, job_id, 'vertex-clips')
+        await advance(conn, job_id, 'rendering', {
+            'provider': 'vertex',
+            'idempotency_key': key,
+            'image_score_id': str(gate_score.get('id') or gate_score.get('image_score_id') or ''),
+            'image_gate': 'pass',
+        })
+
+    prompts = _vertex_clip_prompts(job)
+    clips: list[dict] = []
+    for i, prompt in enumerate(prompts):
+        clip_key = f'{job_id}:vertex-clip-{i}'
+        async with transaction() as conn:
+            existing_clip = await jobs.get_key(conn, clip_key)
+            if existing_clip and existing_clip.get('result'):
+                clips.append(_decode_result(existing_clip['result']))
+                continue
+            await jobs.reserve_key(conn, clip_key, job_id, f'vertex-clip-{i}')
+        try:
+            op = await vertex.start_clip_generation(
+                job_id=job_id, prompt=prompt, clip_index=i, reference_images=reference_images,
+            )
+        except Exception as exc:
+            async with transaction() as conn:
+                await jobs.clear_key(conn, clip_key)
+                await _fail_step(conn, job_id, key, {
+                    'step': 'vertex-clips', 'provider': 'vertex', 'clip_index': i, 'error': str(exc),
+                })
+            raise
+        clip_result = {
+            'clip_index': i, 'operation_name': op.operation_name, 'status': 'running', 'prompt': prompt,
+        }
+        clips.append(clip_result)
+        async with transaction() as conn:
+            await conn.execute(
+                'UPDATE idempotency_keys SET result=$2::jsonb WHERE key=$1',
+                clip_key, json.dumps(clip_result),
+            )
+
+    async with transaction() as conn:
+        asset = await conn.fetchrow(
+            "INSERT INTO assets(job_id,kind,url,storage_path,meta) VALUES($1,'video_clip',NULL,NULL,$2::jsonb) RETURNING *",
+            job_id, json.dumps({'provider': 'vertex', 'clips': clips}),
+        )
+        response = {
+            'asset_id': str(asset['id']), 'status': 'rendering', 'kind': 'video_clip',
+            'clip_count': len(clips), 'clips': clips,
+        }
+        await conn.execute(
+            'UPDATE idempotency_keys SET result=$2::jsonb WHERE key=$1',
+            key, json.dumps(response),
+        )
+        return response
+
+
+async def render_vertex(job_id: UUID, clips: list[dict] | None = None) -> dict:
+    """ffmpeg stitch + caption step once all 3 Vertex clips are downloaded
+    locally. Vertex-flow analog of render(); triggered by
+    reconcile_vertex_clips, not queued independently (there is no external
+    signal to wait on beyond the clip downloads it already just did).
+    """
+    key = f'{job_id}:vertex-render'
+    async with transaction() as conn:
+        existing = await jobs.get_key(conn, key)
+        if existing:
+            return _decode_result(existing['result']) or {'status': 'in_progress', 'idempotency_key': key}
+        job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', job_id)
+        if not job:
+            raise LookupError('job not found')
+        if clips is None:
+            asset = await conn.fetchrow(
+                "SELECT * FROM assets WHERE job_id=$1 AND kind='video_clip'", job_id,
+            )
+            meta = asset['meta'] if asset else {}
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+            clips = list((meta or {}).get('clips') or [])
+        await jobs.reserve_key(conn, key, job_id, 'vertex-render')
+        # generate_vertex_clips already advanced the job to 'rendering'; the
+        # legacy state machine has no self-loop (rendering -> rendering is
+        # illegal), so only advance if we're not already there.
+        if job['status'] != 'rendering':
+            await advance(conn, job_id, 'rendering', {'idempotency_key': key, 'provider': 'ffmpeg'})
+
+    ordered = sorted(clips, key=lambda c: c.get('clip_index', 0))
+    clip_paths = [c['local_path'] for c in ordered if c.get('local_path')]
+    if len(clip_paths) != len(ordered) or not clip_paths:
+        async with transaction() as conn:
+            await _fail_step(conn, job_id, key, {
+                'step': 'vertex-render', 'error': 'missing local clip file(s) for ffmpeg render',
+            })
+        raise ffmpeg_render.FfmpegRenderError('missing local clip file(s) for ffmpeg render')
+
+    try:
+        result = await ffmpeg_render.render(dict(job), clip_paths)
+    except Exception as exc:
+        async with transaction() as conn:
+            await _fail_step(conn, job_id, key, {
+                'step': 'vertex-render', 'provider': 'ffmpeg', 'error': str(exc),
+            })
+        raise
+
+    async with transaction() as conn:
+        asset = await conn.fetchrow(
+            "INSERT INTO assets(job_id,kind,url,storage_path,meta) VALUES($1,'final',$2,$3,$4::jsonb) RETURNING *",
+            job_id, result.get('url'), result.get('storage_path'),
+            json.dumps({**(result.get('meta') or {}), 'aspect': '9:16', 'role': 'primary', 'provider': 'vertex+ffmpeg'}),
+        )
+        await advance(conn, job_id, 'rendered', {'asset_id': str(asset['id'])})
+        await conn.execute(
+            'UPDATE idempotency_keys SET result=$2::jsonb WHERE key=$1',
+            key, json.dumps({'asset_id': str(asset['id']), 'status': 'rendered'}),
+        )
+        response = {'asset_id': str(asset['id']), 'status': 'rendered', 'kind': 'final'}
+        response = await _stage_for_approval(conn, job_id, response)
+    await outbox.flush_outbox(limit=10)
+    try:
+        from . import metrics
+        await metrics.incr('jobs_rendered', labels={'provider': 'vertex'})
+        await metrics.incr('jobs_staged', labels={'provider': 'vertex'})
+    except Exception:
+        pass
+    return response
+
+
+async def reconcile_vertex_clips(job_id: UUID) -> dict:
+    """Poll Vertex for each of a job's pending clip LROs; once all 3 are
+    done, download the bytes locally and run the ffmpeg stitch+caption step.
+
+    Unlike reconcile_job (a stuck-job safety net for HeyGen, which normally
+    completes via webhook), this IS the only path Vertex clip completion is
+    ever observed on — Vertex has no webhook/callback support for video
+    generation (see vertex.py module docstring).
+    """
+    async with transaction() as conn:
+        job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', job_id)
+        if not job:
+            raise LookupError('job not found')
+        if job['status'] != 'rendering':
+            return {
+                'job_id': str(job_id), 'status': job['status'], 'reconciled': False,
+                'reason': 'job not in a stuck-eligible status',
+            }
+        asset = await conn.fetchrow(
+            "SELECT * FROM assets WHERE job_id=$1 AND kind='video_clip'", job_id,
+        )
+        if not asset:
+            return {
+                'job_id': str(job_id), 'status': job['status'], 'reconciled': False,
+                'reason': 'no vertex video_clip asset to reconcile',
+            }
+        meta = asset['meta']
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        clips = [dict(c) for c in (meta.get('clips') or [])]
+
+    changed = False
+    any_failed = False
+    for clip in clips:
+        if clip.get('status') != 'running':
+            continue
+        try:
+            op = await vertex.get_clip_operation(clip['operation_name'])
+        except Exception as exc:  # noqa: BLE001
+            clip['status'] = 'failed'
+            clip['error'] = str(exc)
+            changed = True
+            any_failed = True
+            continue
+        if not op.done:
+            continue
+        changed = True
+        if op.error:
+            clip['status'] = 'failed'
+            clip['error'] = op.error
+            any_failed = True
+            continue
+        if not (op.video_bytes_b64 or op.video_gcs_uri):
+            clip['status'] = 'failed'
+            clip['error'] = 'operation completed with no video in response'
+            any_failed = True
+            continue
+        if op.video_bytes_b64:
+            video_bytes = base64.b64decode(op.video_bytes_b64)
+            relative = f"vertex/{job_id}-clip-{clip.get('clip_index')}.mp4"
+            storage.save_bytes(relative, video_bytes)
+            clip['storage_path'] = relative
+            clip['local_path'] = storage.absolute_path(relative)
+        else:
+            # gcsUri delivery mode: no local bytes to stitch with ffmpeg yet.
+            # Flagged unverified — Make's `delivery: "inline"` observation
+            # suggests bytesBase64Encoded is the normal path; a GCS-only
+            # response needs a download step this module does not implement.
+            clip['status'] = 'failed'
+            clip['gcs_uri'] = op.video_gcs_uri
+            clip['error'] = 'gcsUri delivery not supported by this ffmpeg-local render path'
+            any_failed = True
+            continue
+        clip['status'] = 'completed'
+        clip['mime_type'] = op.mime_type
+
+    if changed or any_failed:
+        async with transaction() as conn:
+            await conn.execute(
+                "UPDATE assets SET meta = jsonb_set(meta, '{clips}', $2::jsonb, true), updated_at = now() "
+                "WHERE job_id=$1 AND kind='video_clip'",
+                job_id, json.dumps(clips),
+            )
+
+    if any_failed:
+        async with transaction() as conn:
+            await _fail_step(conn, job_id, f'{job_id}:vertex-clips', {
+                'step': 'vertex-clips', 'error': 'one or more clips failed', 'clips': clips,
+            })
+        return {'job_id': str(job_id), 'status': 'failed', 'reconciled': True}
+
+    if not all(c.get('status') == 'completed' for c in clips):
+        return {
+            'job_id': str(job_id), 'status': job['status'], 'reconciled': False,
+            'reason': 'provider still in progress',
+            'pending': [c.get('clip_index') for c in clips if c.get('status') != 'completed'],
+        }
+
+    return await render_vertex(job_id, clips)
+
+
 async def distribute(job_id: UUID) -> dict:
     """Phase 4 distribution — approval-gated.
 
@@ -655,7 +964,19 @@ async def distribute_stub(job_id: UUID) -> dict:
 
 
 async def reconcile_job(job_id: UUID) -> dict:
-    """Poll HeyGen for a job stuck in rendering; apply terminal success/failure."""
+    """Poll HeyGen for a job stuck in rendering; apply terminal success/failure.
+
+    Routes to reconcile_vertex_clips first when a Vertex 'video_clip' asset
+    is present for this job — for that provider polling IS the only
+    completion path (no webhook), not a stuck-job fallback like it is here.
+    """
+    async with transaction() as conn:
+        vertex_clip_asset = await conn.fetchrow(
+            "SELECT 1 FROM assets WHERE job_id=$1 AND kind='video_clip'", job_id,
+        )
+    if vertex_clip_asset:
+        return await reconcile_vertex_clips(job_id)
+
     async with transaction() as conn:
         job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', job_id)
         if not job:

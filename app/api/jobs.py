@@ -49,6 +49,10 @@ class AvatarEnqueueBody(BaseModel):
     include_horizontal: bool | None = None
 
 
+class VertexClipsEnqueueBody(BaseModel):
+    reference_images: list[dict] | None = None
+
+
 def _verify_inbound_hmac(raw_body: bytes, signature: str | None, secret: str, name: str) -> None:
     if not secret:
         raise HTTPException(503, f'{name} webhook secret is not configured')
@@ -184,9 +188,24 @@ async def avatar(job_id: UUID, body: AvatarEnqueueBody | None = None):
     return _queued(work)
 
 
+@router.post('/jobs/{job_id}/generate-vertex-clips', status_code=202, dependencies=[Depends(require_api_key)])
+async def vertex_clips(job_id: UUID, body: VertexClipsEnqueueBody | None = None):
+    """Enqueue the 3 Vertex Veo clip generations; completion via reconcile only
+    (no webhook path — see app/services/vertex.py)."""
+    payload = {}
+    if body and body.reference_images:
+        payload['reference_images'] = body.reference_images
+    try:
+        work = await queue.enqueue_step(job_id, 'generate_vertex_clips', payload)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc))
+    return _queued(work)
+
+
 @router.post('/jobs/{job_id}/reconcile', dependencies=[Depends(require_api_key)])
 async def reconcile(job_id: UUID):
-    """Poll HeyGen get_video for a stuck rendering job and apply terminal state."""
+    """Poll the provider (HeyGen, or Vertex when a video_clip asset is
+    present) for a stuck rendering job and apply terminal state."""
     try:
         return await pipeline.reconcile_job(job_id)
     except LookupError as exc:
