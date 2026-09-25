@@ -1,10 +1,13 @@
 from uuid import UUID
+import hashlib
 import json
+import secrets
 from typing import Any
 from ..db import transaction
-from ..state_machine import advance
+from ..state_machine import advance, canonicalize, _has_transition_job
 from ..config import settings
 from . import scriptgen
+from .identity import resolve_actor_identity, unverified_identity_label
 
 
 def _parse_json_field(v):
@@ -52,22 +55,58 @@ async def create_job(
         platforms=platforms,
     )
     async with transaction() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO jobs(script_text, script, meta, status)
-            VALUES($1, $2::jsonb, $3::jsonb, 'pending')
-            RETURNING *
-            """,
-            full_text,
-            json.dumps(script),
-            json.dumps(meta),
-        )
-        if auto_script_ready:
-            row = await advance(conn, row['id'], 'script_ready', {
-                'script': script,
-                'formats': meta.get('formats'),
-                'platform_captions_staged': True,
-            })
+        canonical = await _has_transition_job(conn)
+        if canonical:
+            # Canonical schema (supabase/migrations/*.sql) has no `script`
+            # column and no 'pending' job_status value — the legal initial
+            # status is the column default 'draft'. Structured script
+            # fields already have a home: `meta` is the established jsonb
+            # catch-all scriptgen writes formats/platform_captions/
+            # awaiting_approval/auto_publish into, so the hook/body/cta
+            # breakdown goes there too rather than a redundant new column.
+            meta_to_store = dict(meta)
+            meta_to_store['script'] = script
+            # jobs.idempotency_key / jobs.script_hash are NOT NULL with no
+            # column default on canonical (unlike the legacy-compat
+            # overlay, which patches in defaults for exactly this reason
+            # — see tests/_sot_app_compat.sql). script_hash mirrors the
+            # DB-native create_job() RPC's own hashing (001); this
+            # app-level path has no request-level dedup contract of its
+            # own, so idempotency_key only needs to be unique per call.
+            script_hash = hashlib.sha256(full_text.strip().encode()).hexdigest()
+            idempotency_key = f"{script_hash}:{secrets.token_hex(8)}"
+            row = await conn.fetchrow(
+                """
+                INSERT INTO jobs(script_text, meta, status, script_hash, idempotency_key)
+                VALUES($1, $2::jsonb, 'draft', $3, $4)
+                RETURNING *
+                """,
+                full_text,
+                json.dumps(meta_to_store),
+                script_hash,
+                idempotency_key,
+            )
+            # 'draft' already reflects "script composed and staged" for the
+            # canonical graph — there is no separate 'script_ready' concept
+            # to advance into (canonicalize('script_ready') == 'draft').
+        else:
+            # Legacy graph (schema.sql / tests/_sot_app_compat.sql overlay).
+            row = await conn.fetchrow(
+                """
+                INSERT INTO jobs(script_text, script, meta, status)
+                VALUES($1, $2::jsonb, $3::jsonb, 'pending')
+                RETURNING *
+                """,
+                full_text,
+                json.dumps(script),
+                json.dumps(meta),
+            )
+            if auto_script_ready:
+                row = await advance(conn, row['id'], 'script_ready', {
+                    'script': script,
+                    'formats': meta.get('formats'),
+                    'platform_captions_staged': True,
+                })
     # metrics outside txn
     from . import metrics as metrics_mod
     try:
@@ -88,11 +127,39 @@ async def get_job_detail(job_id: UUID) -> dict | None:
         job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1', job_id)
         if not job:
             return None
-        assets = await conn.fetch(
-            'SELECT * FROM assets WHERE job_id=$1 ORDER BY created_at, id', job_id
+        # Legacy graph (tests/_sot_app_compat.sql) adds assets.job_id so
+        # assets are job-scoped by FK-on-the-asset-row. Canonical schema
+        # (supabase/migrations/*.sql) has no such column — assets are
+        # linked the other way, via jobs.script_asset_id / audio_asset_id
+        # / video_asset_id / thumb_asset_id pointing AT an assets row.
+        has_asset_job_id = await conn.fetchval(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='assets' AND column_name='job_id'"
         )
+        if has_asset_job_id:
+            assets = await conn.fetch(
+                'SELECT * FROM assets WHERE job_id=$1 ORDER BY created_at, id', job_id
+            )
+        else:
+            asset_ids = [
+                job[k] for k in
+                ('script_asset_id', 'audio_asset_id', 'video_asset_id', 'thumb_asset_id')
+                if k in job.keys() and job[k] is not None
+            ]
+            assets = await conn.fetch(
+                'SELECT * FROM assets WHERE id = ANY($1::uuid[]) ORDER BY created_at, id',
+                asset_ids,
+            ) if asset_ids else []
+        # Legacy graph (tests/_sot_app_compat.sql) has `events`; canonical
+        # schema (supabase/migrations/*.sql) only has `job_events` — same
+        # table-name split transition_job's own audit insert follows.
+        has_events = await conn.fetchval(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema='public' AND table_name='events'"
+        )
+        events_table = 'events' if has_events else 'job_events'
         events = await conn.fetch(
-            'SELECT * FROM events WHERE job_id=$1 ORDER BY created_at, id', job_id
+            f'SELECT * FROM {events_table} WHERE job_id=$1 ORDER BY created_at, id', job_id
         )
         work = await conn.fetch(
             'SELECT * FROM work_queue WHERE job_id=$1 ORDER BY created_at, id', job_id
@@ -111,13 +178,21 @@ async def get_job_detail(job_id: UUID) -> dict | None:
         for e in events
     ]
     job_out = _serialize_row(job)
+    meta_parsed = _parse_json_field(job['meta']) if 'meta' in job.keys() else {}
+    # Legacy graph stores structured script in a real `script` column;
+    # canonical graph (no such column) stores it under meta['script'].
+    script_parsed = (
+        _parse_json_field(job['script']) if 'script' in job.keys()
+        else (meta_parsed or {}).get('script', {})
+    )
+    status_c = canonicalize(job['status'])
     return {
         'job': job_out,
         'status': job['status'],
-        'script': _parse_json_field(job['script']) if 'script' in job.keys() else {},
-        'meta': _parse_json_field(job['meta']) if 'meta' in job.keys() else {},
-        'awaiting_approval': job['status'] == 'staged',
-        'approved': job['status'] in ('approved', 'delivered'),
+        'script': script_parsed,
+        'meta': meta_parsed,
+        'awaiting_approval': status_c == 'review',
+        'approved': status_c in ('approved', 'published'),
         'assets': [_serialize_row(a) for a in assets],
         'events': [_serialize_row(e) for e in events],
         'status_history': status_history,
@@ -144,37 +219,75 @@ async def approve_job(
     job_id: UUID,
     *,
     approved_by: str | None = None,
+    approved_by_key: str | None = None,
     enqueue_distribute: bool = True,
     note: str | None = None,
 ) -> dict:
-    """Flip staged → approved. Optionally enqueue distribute stub (no public post)."""
+    """Flip staged/review → approved. Optionally enqueue distribute stub (no public post).
+
+    Identity of record for `approved_by` / `approved_by_key_id`:
+      - `approved_by_key` (the raw credential a caller presented to pass
+        HTTP auth — see app/api/jobs.py) is resolved against `api_keys`
+        via verify_api_key(). A verified match wins: it is the only path
+        that can set `approved_by_key_id` (a real FK, never spoofable).
+        No match (no api_keys rows provisioned yet — today's common
+        deployment) falls back to a label derived from the credential
+        itself, never from arbitrary client text.
+      - `approved_by` is a plain string honored only for *trusted direct
+        callers* — the CLI (already has raw DATABASE_URL access, the same
+        trust tier as SQL) and internal/test code calling this function
+        directly in-process. The public HTTP endpoint no longer forwards
+        its request body's `approved_by` field as the actor of record;
+        see the note in app/api/jobs.py::approve_endpoint.
+    """
     from . import queue
 
     async with transaction() as conn:
         job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', job_id)
         if not job:
             raise LookupError('job not found')
-        if job['status'] != 'staged':
+        # canonicalize() makes this check graph-agnostic: 'staged' (legacy)
+        # and 'review' (canonical) both mean "awaiting human approval".
+        # Also correctly refuses a second approve (status is already
+        # 'approved', which canonicalizes to itself, not 'review').
+        if canonicalize(job['status']) != 'review':
             raise ValueError(
-                f'job status is {job["status"]}, expected staged '
-                f'(nothing auto-publishes; approve only from staged)'
+                f'job status is {job["status"]}, expected staged/review '
+                f'(nothing auto-publishes; approve only from staged/review)'
             )
-        who = (approved_by or 'operator').strip() or 'operator'
+
+        identity = await resolve_actor_identity(conn, approved_by_key)
+        if identity is not None:
+            who = identity['name']
+            who_key_id = UUID(identity['id'])
+            identity_source = 'api_keys'
+        elif approved_by_key:
+            who = unverified_identity_label(approved_by_key)
+            who_key_id = None
+            identity_source = 'shared_secret_unverified'
+        else:
+            who = (approved_by or 'operator').strip() or 'operator'
+            who_key_id = None
+            identity_source = 'trusted_caller' if approved_by else 'default'
+
         await conn.execute(
             """
             UPDATE jobs
             SET approved_at = now(),
                 approved_by = $2,
-                meta = COALESCE(meta, '{}'::jsonb) || $3::jsonb,
+                approved_by_key_id = $3,
+                meta = COALESCE(meta, '{}'::jsonb) || $4::jsonb,
                 updated_at = now()
             WHERE id = $1
             """,
             job_id,
             who,
+            who_key_id,
             json.dumps({
                 'awaiting_approval': False,
                 'approval_note': note,
                 'auto_publish': False,
+                'approval_identity_source': identity_source,
             }),
         )
         row = await advance(conn, job_id, 'approved', {

@@ -43,6 +43,25 @@ async def apply_schema(conn):
         await conn.execute(compat.read_text())
 
 
+async def apply_canonical_schema(conn):
+    """Reset public schema, apply ONLY the deploy SoT — no compat overlay.
+
+    Unlike apply_schema(), this leaves supabase/migrations' real
+    transition_job RPC (and the real job_status enum, with no legacy
+    values like 'pending'/'staged' added back in) fully live and
+    untouched. Used by tests/test_canonical_approval.py to exercise
+    app.services.jobs.create_job / approve_job against the actual
+    canonical approval gate, not the legacy Python fallback graph.
+    """
+    await conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+    await conn.execute("CREATE SCHEMA public")
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+    root = Path(__file__).resolve().parents[1]
+    mig_dir = root / "supabase" / "migrations"
+    for path in sorted(mig_dir.glob("*.sql")):
+        await conn.execute(path.read_text())
+
+
 async def truncate_app_tables(conn):
     """Truncate all public tables (SoT names differ from legacy webhook_outbox/events)."""
     await conn.execute(
