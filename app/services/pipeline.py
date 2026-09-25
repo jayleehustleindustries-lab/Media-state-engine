@@ -4,7 +4,7 @@ import json
 from . import elevenlabs, remotion, heygen, vertex, ffmpeg_render, jobs, webhooks, outbox, storage
 from .image_gate import assert_pass_for_heygen, GateRefuse
 from ..db import transaction
-from ..state_machine import advance, IllegalTransition
+from ..state_machine import advance, IllegalTransition, status_matches
 from ..config import settings
 
 
@@ -69,7 +69,7 @@ async def _fail_step(conn, job_id: UUID, key: str, payload: dict):
     except IllegalTransition:
         # Already terminal or unexpected — still clear key above.
         job = await conn.fetchrow('SELECT status FROM jobs WHERE id=$1', job_id)
-        if job and job['status'] != 'failed':
+        if job and not status_matches(job['status'], 'failed'):
             raise
 
 
@@ -476,12 +476,12 @@ async def complete_heygen_webhook(event_type: str, video_id: str, event_data: di
                 'kind': 'final_h',
             }
 
-        if job['status'] in ('rendered', 'staged', 'approved', 'delivered'):
+        if any(status_matches(job['status'], s) for s in ('rendered', 'staged', 'approved', 'delivered')):
             return {
                 'job_id': str(job['id']), 'asset_id': str(asset['id']),
                 'video_id': video_id, 'status': job['status'],
             }
-        if job['status'] == 'failed':
+        if status_matches(job['status'], 'failed'):
             return {
                 'job_id': str(job['id']), 'asset_id': str(asset['id']),
                 'video_id': video_id, 'status': 'failed',
@@ -616,12 +616,24 @@ async def generate_vertex_clips(job_id: UUID, reference_images: list[dict] | Non
         except GateRefuse:
             raise
         await jobs.reserve_key(conn, key, job_id, 'vertex-clips')
+        # Both False: visible off-switches, not silent bypasses.
+        # require_quality_pass — no real hook/script quality scorer exists yet
+        # (task #17); nothing populates content_quality_scores, so the
+        # DB-level gate's NULL verdict would otherwise block every job here.
+        # require_image_pass — the DB-level gate requires the job's actual
+        # state HISTORY to have passed through image_queued/running/ready,
+        # not just that some Python check said pass. Vertex bakes identity
+        # locking into generateVideoWithOmni itself — there is no separate
+        # pre-render image output to run through that state sequence (that's
+        # why task #16 moves the real image gate to score extracted clip
+        # frames AFTER generation instead). assert_pass_for_heygen() above
+        # still runs as a real Python-level check in the meantime.
         await advance(conn, job_id, 'rendering', {
             'provider': 'vertex',
             'idempotency_key': key,
             'image_score_id': str(gate_score.get('id') or gate_score.get('image_score_id') or ''),
             'image_gate': 'pass',
-        })
+        }, require_quality_pass=False, require_image_pass=False)
 
     prompts = _vertex_clip_prompts(job)
     clips: list[dict] = []
@@ -693,11 +705,15 @@ async def render_vertex(job_id: UUID, clips: list[dict] | None = None) -> dict:
                 meta = json.loads(meta)
             clips = list((meta or {}).get('clips') or [])
         await jobs.reserve_key(conn, key, job_id, 'vertex-render')
-        # generate_vertex_clips already advanced the job to 'rendering'; the
-        # legacy state machine has no self-loop (rendering -> rendering is
-        # illegal), so only advance if we're not already there.
-        if job['status'] != 'rendering':
-            await advance(conn, job_id, 'rendering', {'idempotency_key': key, 'provider': 'ffmpeg'})
+        # generate_vertex_clips already advanced the job to 'rendering'
+        # (canonical: 'render_running'); neither graph allows a self-loop, so
+        # only advance if we're not already there. status_matches()
+        # canonicalizes both sides so this holds on legacy and canonical.
+        if not status_matches(job['status'], 'rendering'):
+            await advance(
+                conn, job_id, 'rendering', {'idempotency_key': key, 'provider': 'ffmpeg'},
+                require_quality_pass=False, require_image_pass=False,
+            )
 
     ordered = sorted(clips, key=lambda c: c.get('clip_index', 0))
     clip_paths = [c['local_path'] for c in ordered if c.get('local_path')]
@@ -753,7 +769,7 @@ async def reconcile_vertex_clips(job_id: UUID) -> dict:
         job = await conn.fetchrow('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', job_id)
         if not job:
             raise LookupError('job not found')
-        if job['status'] != 'rendering':
+        if not status_matches(job['status'], 'rendering'):
             return {
                 'job_id': str(job_id), 'status': job['status'], 'reconciled': False,
                 'reason': 'job not in a stuck-eligible status',
@@ -860,7 +876,7 @@ async def distribute(job_id: UUID) -> dict:
         if not job:
             raise LookupError('job not found')
         # Idempotent success if already distributed
-        if job['status'] == 'delivered':
+        if status_matches(job['status'], 'delivered'):
             meta = _job_meta(job)
             return {
                 'job_id': str(job_id),
@@ -872,7 +888,7 @@ async def distribute(job_id: UUID) -> dict:
                 'idempotent': True,
                 'stub': False,
             }
-        if job['status'] != 'approved':
+        if not status_matches(job['status'], 'approved'):
             raise ValueError(
                 f'refuse distribute: job status is {job["status"]}, expected approved '
                 f'(nothing auto-publishes without explicit approve)'
@@ -1001,7 +1017,7 @@ async def reconcile_job(job_id: UUID) -> dict:
         meta = meta or {}
         if not asset or not meta.get('video_id'):
             # No provider handle — if stuck in audio_generating with no progress, fail.
-            if job['status'] == 'audio_generating':
+            if status_matches(job['status'], 'audio_generating'):
                 key = f'{job_id}:audio'
                 await _fail_step(conn, job_id, key, {
                     'step': 'reconcile', 'error': 'stuck in audio_generating with no recoverable provider handle',

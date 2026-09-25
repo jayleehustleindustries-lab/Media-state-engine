@@ -76,6 +76,17 @@ TRANSITIONS = {
 AWAITING_APPROVAL = frozenset({'review', 'staged'})
 DISTRIBUTABLE = frozenset({'approved'})
 
+# Canonical requires a real queued->running hop that the legacy graph collapsed
+# into one status. A legacy-style single-hop advance() (e.g. 'rendering',
+# which canonicalizes to 'render_running') must pass through the queued
+# precursor first on canonical, or the RPC rejects it as an illegal jump from
+# whatever pre-render state the job is actually in (draft/image_ready/tts_done/...).
+CANONICAL_PRESTEP = {
+    'render_running': 'render_queued',
+    'tts_running': 'tts_queued',
+    'image_running': 'image_queued',
+}
+
 
 class IllegalTransition(ValueError):
     pass
@@ -87,6 +98,14 @@ def canonicalize(status: str) -> str:
     if status in LEGACY_TO_CANONICAL:
         return LEGACY_TO_CANONICAL[status]
     return status
+
+
+def status_matches(current: str, target: str) -> bool:
+    """True if `current` represents the same logical stage as `target`,
+    across legacy/canonical naming (both sides canonicalized before compare).
+    Use this instead of a raw `status == 'rendering'` string check anywhere
+    that check must hold on both graphs."""
+    return canonicalize(current) == canonicalize(target)
 
 
 async def _has_transition_job(conn) -> bool:
@@ -192,6 +211,44 @@ async def transition(
     return row
 
 
-async def advance(conn, job_id: UUID, to_status: str, payload: dict[str, Any] | None = None):
-    """Legacy wrapper used by older pipeline code."""
-    return await transition(conn, job_id, to_status, payload=payload or {})
+async def advance(
+    conn,
+    job_id: UUID,
+    to_status: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    require_quality_pass: bool = True,
+    require_image_pass: bool = True,
+):
+    """Legacy wrapper used by older pipeline code.
+
+    On canonical, some legacy single-hop targets (e.g. 'rendering' ->
+    canonical 'render_running') actually require a real intermediate
+    'queued' hop first (draft -> render_queued -> render_running) that the
+    legacy graph never needed. Insert that hop automatically here so every
+    existing pipeline.py call site keeps working unmodified on both graphs,
+    instead of hand-patching each of the ~11 call sites individually (the
+    graph knowledge stays centralized in one place, not scattered).
+
+    require_quality_pass/require_image_pass default True (unchanged prior
+    behavior) and forward straight to transition_job's real DB-level gates.
+    Vertex's pipeline.py call sites pass require_quality_pass=False
+    explicitly as a visible off-switch (no real hook/script quality scorer
+    exists yet — task #17), not silently here.
+    """
+    payload = payload or {}
+    if await _has_transition_job(conn):
+        canonical_to = canonicalize(to_status)
+        prestep = CANONICAL_PRESTEP.get(canonical_to)
+        if prestep:
+            job = await conn.fetchrow('SELECT status FROM jobs WHERE id=$1', job_id)
+            current_canonical = canonicalize(job['status']) if job else None
+            if current_canonical not in (canonical_to, prestep):
+                await transition(
+                    conn, job_id, prestep, payload=payload,
+                    require_quality_pass=require_quality_pass, require_image_pass=require_image_pass,
+                )
+    return await transition(
+        conn, job_id, to_status, payload=payload,
+        require_quality_pass=require_quality_pass, require_image_pass=require_image_pass,
+    )
