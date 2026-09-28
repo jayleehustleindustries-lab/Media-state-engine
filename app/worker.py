@@ -132,9 +132,11 @@ async def tick(*, also_reconcile: bool = False) -> dict[str, int]:
     # Voice archives are deliberately separate from render job work: no archive
     # is queued without per-session consent and a failed archive cannot block a
     # live conversation or a paid avatar render.
-    stats["voice_archive"] = await voice_sessions.process_archive_queue(
-        limit=settings.worker_batch_size
-    )
+    # PR21-F2: Job Command voice work only runs when its feature flag is on.
+    if settings.job_command_voice_enabled:
+        stats["voice_archive"] = await voice_sessions.process_archive_queue(
+            limit=settings.worker_batch_size
+        )
 
     stats["outbox"] = await outbox.flush_outbox(limit=20)
 

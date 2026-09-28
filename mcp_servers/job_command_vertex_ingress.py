@@ -12,12 +12,19 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from google.cloud import pubsub_v1
 
 try:  # Support both `uvicorn mcp_servers...` and direct script execution.
-    from .job_command_pipeline_policy import JobCommandEvent, canonical_event_payload, idempotency_key, verify_hmac
+    from .job_command_pipeline_policy import (
+        PENDING_APPROVAL, RENDER_EVENT, JobCommandEvent, canonical_event_payload,
+        idempotency_key, is_pending_approval, verify_hmac,
+    )
 except ImportError:  # pragma: no cover - direct script entry point
-    from job_command_pipeline_policy import JobCommandEvent, canonical_event_payload, idempotency_key, verify_hmac
+    from job_command_pipeline_policy import (
+        PENDING_APPROVAL, RENDER_EVENT, JobCommandEvent, canonical_event_payload,
+        idempotency_key, is_pending_approval, verify_hmac,
+    )
 
 
 app = FastAPI(title="Job Command Vertex Ingress", version="1.0.0")
@@ -39,28 +46,46 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "pipeline": "job-command"}
 
 
+def publish_attributes(event: JobCommandEvent) -> dict[str, str]:
+    attributes = {
+        "event_type": event.event_type,
+        "campaign_id": str(event.campaign_id),
+        "event_id": str(event.event_id),
+        "idempotency_key": idempotency_key(event),
+        "source": event.source,
+        "pipeline": "job-command",
+    }
+    if event.event_type == RENDER_EVENT:
+        # Only reachable after verify_render_approval passed in validation.
+        attributes["approval_ref"] = event.approval_ref or ""
+        attributes["approval_verified"] = "true"
+    return attributes
+
+
 @app.post("/events")
-async def receive_event(request: Request) -> dict[str, Any]:
+async def receive_event(request: Request) -> Any:
     raw = await request.body()
+    # PR21-F12: 401 only for signature failures.
     try:
         verify_hmac(raw, request.headers.get("x-job-command-signature"), os.getenv("JOB_COMMAND_INGRESS_SECRET", ""))
+    except ValueError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    try:
         payload = json.loads(raw)
         event = JobCommandEvent.model_validate(payload)
     except (ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(401, str(exc)) from exc
+        if is_pending_approval(exc):
+            # PR21-F3: fail closed — nothing is published without approval.
+            return JSONResponse(
+                status_code=409,
+                content={"accepted": False, "published": False, "status": PENDING_APPROVAL,
+                         "detail": "campaign.render_requested requires a verified human approval record."},
+            )
+        raise HTTPException(400, f"Invalid Job Command event: {exc}"[:1000]) from exc
 
     try:
         publisher, topic = _publisher()
-        future = publisher.publish(
-            topic,
-            canonical_event_payload(event),
-            event_type=event.event_type,
-            campaign_id=str(event.campaign_id),
-            event_id=str(event.event_id),
-            idempotency_key=idempotency_key(event),
-            source=event.source,
-            pipeline="job-command",
-        )
+        future = publisher.publish(topic, canonical_event_payload(event), **publish_attributes(event))
         message_id = future.result(timeout=20)
     except Exception as exc:  # publishing failure must trigger Vercel retry logic
         raise HTTPException(503, "Campaign event enqueue failed.") from exc

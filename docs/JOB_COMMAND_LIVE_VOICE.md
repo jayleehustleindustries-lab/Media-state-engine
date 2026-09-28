@@ -46,7 +46,11 @@ flowchart LR
 
 ## Backend endpoints
 
-All endpoints except the provider webhook require the Media State Engine API key. In production, the Vercel route calls these endpoints server-to-server; the browser should **not** hold this API key.
+All Job Command routes (including the webhook) return **404 unless `JOB_COMMAND_VOICE_ENABLED=true`**. All endpoints except the provider webhook require the dedicated **`JOB_COMMAND_API_KEY`** (constant-time compared; the Media State Engine key is refused, and the two keys must differ). In production, the Vercel route calls these endpoints server-to-server; the browser should **not** hold this API key.
+
+`POST /voice/sessions` is bounded before any ElevenLabs call (PR21-F4): a durable reservation in `voice_mint_attempts` enforces per-API-key, per-client-IP and per-`visitor_ref` short-window limits plus a global UTC-day cap (`JOB_COMMAND_VOICE_*` env vars; defaults 10/10/3 per 60 s and 50/day). Over-limit returns **429** (with `Retry-After` for window limits). Failed provider calls still consume budget. Any limit ≤ 0 disables minting.
+
+> **Isolation status:** voice still shares the MSE API process, Postgres database and worker. Separate key, flag, and provider credentials limit blast radius today; a dedicated deployment/DB/worker is a follow-up.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -99,7 +103,7 @@ export async function POST(req: Request) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-api-key": process.env.MEDIA_ENGINE_API_KEY!,
+      "x-api-key": process.env.JOB_COMMAND_API_KEY!, // NOT the MSE key
     },
     body: JSON.stringify({
       visitor_ref: `user:${user.id}`, // server-derived, opaque to the provider
@@ -120,14 +124,15 @@ Use the official ElevenLabs browser client SDK (WebRTC is its normal browser tra
 | --- | --- | --- |
 | `voice_agent_profiles` | Provider agent ID, operator ownership references, supported languages, policy | Locks Job Command routing to the approved profile. |
 | `voice_sessions` | Opaque visitor ref, chosen language, consent, provider conversation ID, lifecycle state | Durable control-plane record. **No signed URL or API key.** |
-| `voice_session_events` | Verified provider event, idempotency key, event type | Deduplicates post-call callback retries. |
+| `voice_session_events` | Verified provider event with audio/binary fields **redacted** (size + sha256 only); unmatched callbacks keep a metadata-only envelope; consented audio is referenced via `audio_ref` | Deduplicates post-call callback retries. Raw audio never enters Postgres. |
+| `voice_mint_attempts` | Fingerprints (sha256) of caller key and client IP, visitor ref, outcome | Durable signed-URL mint rate limits and daily cap. |
 | `voice_transcript_turns` | Final provider turns and optional Gemini archive text | Conversation record with source attribution. |
 | `voice_transcription_runs` | Gemini model/mode/status and consented source path | Auditable post-call archive workflow. |
 | `voice_work_queue` | Retryable Gemini archive work | Keeps heavy transcription outside the webhook response. |
 
 ## Gemini archive rules
 
-When a caller opted into archive processing and ElevenLabs sends a `post_call_audio` event, the engine stores the base64 MP3 locally and queues a Gemini file-transcription job.
+When a caller opted into archive processing and ElevenLabs sends a `post_call_audio` event, the engine decodes the MP3 to the archive storage path, records only an `audio_ref` in Postgres, and queues a Gemini file-transcription job. Without consent (or for an unmatched session) the audio is discarded: nothing is written to disk and the event row keeps only a redaction marker. Crashed archive claims are reclaimed after `VOICE_WORK_QUEUE_STALE_SECONDS`.
 
 - Default archive mode is **`diarized`**: Gemini 3.5 Transcribe, verbatim transcription, auto language detection, speaker diarization.
 - Gemini diarization is for recorded audio; **do not promise diarization from the Live API**.
@@ -139,7 +144,9 @@ When a caller opted into archive processing and ElevenLabs sends a `post_call_au
 Set these values only in the deployment secret store—never in a browser bundle, committed `.env`, screenshots, or chat:
 
 ```bash
-ELEVENLABS_API_KEY=...
+JOB_COMMAND_VOICE_ENABLED=true          # default false
+JOB_COMMAND_API_KEY=...                 # distinct from MEDIA_ENGINE_API_KEY
+ELEVENLABS_AGENTS_API_KEY=...           # no fallback to ELEVENLABS_API_KEY
 ELEVENLABS_AGENT_ID=...
 ELEVENLABS_AGENTS_WEBHOOK_SECRET=...
 GEMINI_TRANSCRIBE_API_KEY=...
@@ -149,7 +156,7 @@ JOB_COMMAND_OWNER_AVATAR_REF=operator-approved-avatar-v1
 JOB_COMMAND_SUPPORTED_LANGUAGES=en,es,pt-BR
 ```
 
-Keep `ELEVENLABS_API_KEY`, `ELEVENLABS_AGENTS_WEBHOOK_SECRET`, and `GEMINI_TRANSCRIBE_API_KEY` server-only. Configure the ElevenLabs Agent dashboard with the same languages, verified operator voice, appropriate language presets, and the language-detection tool. Configure the post-call webhook to call `POST /webhooks/elevenlabs/voice` with HMAC signing enabled.
+Keep `JOB_COMMAND_API_KEY`, `ELEVENLABS_AGENTS_API_KEY`, `ELEVENLABS_AGENTS_WEBHOOK_SECRET`, and `GEMINI_TRANSCRIBE_API_KEY` server-only. None of them falls back to an MSE credential (`GEMINI_API_KEY`, `ELEVENLABS_API_KEY`, `ELEVENLABS_WEBHOOK_SECRET`). Configure the ElevenLabs Agent dashboard with the same languages, verified operator voice, appropriate language presets, and the language-detection tool. Configure the post-call webhook to call `POST /webhooks/elevenlabs/voice` with HMAC signing enabled.
 
 ## Production readiness gates
 

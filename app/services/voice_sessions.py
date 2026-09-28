@@ -3,22 +3,102 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
+import re
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import asyncpg
+
 from ..config import settings
 from ..db import transaction
 from . import storage
-from . import elevenlabs_agents, gemini_transcribe, voice_router
+from . import elevenlabs_agents, gemini_transcribe, voice_mint_limits, voice_router
 
 
 class VoiceSessionError(RuntimeError):
     pass
 
 
+class VoiceSessionConflict(VoiceSessionError):
+    """Bind refused: wrong state, expired, or conversation already bound (HTTP 409)."""
+
+
 MAX_ARCHIVE_AUDIO_BYTES = 32 * 1024 * 1024
+
+# PR21-F1: provider fields that carry raw audio. They are never written to
+# Postgres; a redaction summary (size + sha256) replaces them.
+AUDIO_FIELD_NAMES = frozenset({
+    "full_audio", "audio", "audio_base64", "audio_b64", "audio_data",
+    "raw_audio", "audio_chunk", "audio_content", "recording",
+})
+# Defensive: any long, whitespace-free base64-looking string is treated as a
+# binary blob even under an unexpected key name.
+_BLOB_MIN_CHARS = 1024
+_BASE64ISH = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
+# Fields kept in the metadata-only envelope for unmatched/unknown sessions.
+_ENVELOPE_DATA_FIELDS = ("agent_id", "conversation_id", "status", "start_time_unix_secs", "call_duration_secs")
+
+
+def _audio_summary(value: Any) -> dict[str, Any]:
+    summary: dict[str, Any] = {"redacted": True}
+    if isinstance(value, str):
+        summary["encoded_chars"] = len(value)
+        summary["sha256"] = sha256(value.encode("utf-8")).hexdigest()
+    elif isinstance(value, (bytes, bytearray)):
+        summary["bytes"] = len(value)
+        summary["sha256"] = sha256(bytes(value)).hexdigest()
+    return summary
+
+
+def _looks_like_blob(value: str) -> bool:
+    return len(value) >= _BLOB_MIN_CHARS and bool(_BASE64ISH.match(value))
+
+
+def redact_binary_fields(value: Any) -> Any:
+    """Return a deep copy of ``value`` with every audio/binary field redacted."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str) and key.lower() in AUDIO_FIELD_NAMES and item is not None:
+                out[key] = _audio_summary(item)
+            else:
+                out[key] = redact_binary_fields(item)
+        return out
+    if isinstance(value, list):
+        return [redact_binary_fields(item) for item in value]
+    if isinstance(value, (bytes, bytearray)):
+        return _audio_summary(value)
+    if isinstance(value, str) and _looks_like_blob(value):
+        return _audio_summary(value)
+    return value
+
+
+def storage_payload(event: dict[str, Any], *, matched_session: bool) -> dict[str, Any]:
+    """Build the ONLY payload shape allowed into ``voice_session_events``.
+
+    * Unmatched callbacks: metadata-only envelope (no transcript, no audio).
+    * Matched callbacks: full event with audio/binary fields redacted. Audio
+      bytes are persisted only on the consented filesystem archive path and
+      referenced by ``audio_ref``; raw base64 never reaches Postgres, whether or
+      not ``archive_consent`` is true.
+    """
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    had_audio = any(isinstance(k, str) and k.lower() in AUDIO_FIELD_NAMES for k in data)
+    if not matched_session:
+        return {
+            "type": event.get("type"),
+            "event_timestamp": event.get("event_timestamp"),
+            "data": {k: data[k] for k in _ENVELOPE_DATA_FIELDS if k in data and not isinstance(data[k], (dict, list))},
+            "minimal_envelope": True,
+            "audio_redacted": had_audio,
+        }
+    payload = redact_binary_fields(event)
+    if had_audio:
+        payload["audio_redacted"] = True
+    return payload
 
 
 def _json(value: Any) -> str:
@@ -106,8 +186,14 @@ async def create_session(
     requested_language: str | None,
     surface: str,
     archive_consent: bool,
+    api_key_fingerprint: str = "unknown",
+    client_ip_fingerprint: str = "unknown",
 ) -> dict[str, Any]:
     """Issue an application session followed by an ephemeral provider credential.
+
+    PR21-F4: a mint reservation (rate limits + daily cap) is taken in the same
+    transaction as the session row, before any provider call. Over-limit raises
+    ``voice_mint_limits.VoiceMintLimited`` and ElevenLabs is never contacted.
 
     The signed URL stays in the response only and is never written to Postgres.
     Its connection options are returned separately so a Vercel client can hand
@@ -127,6 +213,12 @@ async def create_session(
         seconds=settings.voice_session_token_ttl_seconds
     )
     async with transaction() as conn:
+        attempt_id = await voice_mint_limits.reserve_mint(
+            conn,
+            api_key_fingerprint=api_key_fingerprint,
+            client_ip_fingerprint=client_ip_fingerprint,
+            visitor_ref=visitor_ref,
+        )
         profile = await _ensure_profile(conn)
         row = await conn.fetchrow(
             """
@@ -152,6 +244,7 @@ async def create_session(
     except Exception:
         async with transaction() as conn:
             await conn.execute("UPDATE voice_sessions SET state='failed' WHERE id=$1", session["id"])
+            await voice_mint_limits.record_outcome(conn, attempt_id, outcome="failed", session_id=session["id"])
         raise
     async with transaction() as conn:
         await conn.execute(
@@ -159,6 +252,7 @@ async def create_session(
             session["id"],
             provider["expires_at"],
         )
+        await voice_mint_limits.record_outcome(conn, attempt_id, outcome="minted", session_id=session["id"])
     session_id = str(session["id"])
     return {
         "session": _out({**session, "token_expires_at": provider["expires_at"]}),
@@ -190,21 +284,34 @@ async def bind_conversation(session_id: UUID, *, provider_conversation_id: str) 
     value = provider_conversation_id.strip()
     if not value or len(value) > 255:
         raise VoiceSessionError("provider_conversation_id must be 1–255 characters.")
-    async with transaction() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE voice_sessions
-            SET provider_conversation_id=$2,
-                state=CASE WHEN state='issued' THEN 'connected' ELSE state END,
-                connected_at=COALESCE(connected_at, now())
-            WHERE id=$1
-            RETURNING *
-            """,
-            session_id,
-            value,
-        )
-    if not row:
-        raise LookupError("voice session not found")
+    # PR21-F8/F11: only bind a live (issued/connected), unexpired session, and
+    # never overwrite a different conversation id or steal one already bound.
+    try:
+        async with transaction() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE voice_sessions
+                SET provider_conversation_id=$2,
+                    state=CASE WHEN state='issued' THEN 'connected' ELSE state END,
+                    connected_at=COALESCE(connected_at, now())
+                WHERE id=$1
+                  AND state IN ('issued','connected')
+                  AND token_expires_at > now()
+                  AND (provider_conversation_id IS NULL OR provider_conversation_id=$2)
+                RETURNING *
+                """,
+                session_id,
+                value,
+            )
+            if not row:
+                existing = await conn.fetchrow("SELECT id FROM voice_sessions WHERE id=$1", session_id)
+                if not existing:
+                    raise LookupError("voice session not found")
+                raise VoiceSessionConflict(
+                    "voice session cannot be bound: it is not live, has expired, or is bound to another conversation."
+                )
+    except asyncpg.UniqueViolationError as exc:
+        raise VoiceSessionConflict("provider conversation is already bound to another voice session.") from exc
     return _out(row) or {}
 
 
@@ -325,7 +432,9 @@ async def ingest_postcall_event(event: dict[str, Any]) -> dict[str, Any]:
             key,
             event_type,
             conversation_id,
-            _json(event),
+            # PR21-F1: never _json(event) — audio/binary fields are redacted and
+            # unmatched callbacks are reduced to a metadata-only envelope.
+            _json(storage_payload(event, matched_session=bool(session))),
         )
         if not inserted:
             return {"accepted": True, "duplicate": True, "event_type": event_type}
@@ -337,7 +446,12 @@ async def ingest_postcall_event(event: dict[str, Any]) -> dict[str, Any]:
         await conn.execute(
             """
             UPDATE voice_sessions
-            SET provider_conversation_id=COALESCE(provider_conversation_id, $2),
+            SET provider_conversation_id=COALESCE(
+                  provider_conversation_id,
+                  (SELECT $2::text WHERE NOT EXISTS (
+                     SELECT 1 FROM voice_sessions other
+                     WHERE other.provider_conversation_id=$2::text AND other.id<>$1))
+                ),
                 state=CASE WHEN $3='call_initiation_failure' THEN 'failed' WHEN state='archived' THEN state ELSE 'completed' END,
                 completed_at=COALESCE(completed_at, now())
             WHERE id=$1
@@ -374,6 +488,12 @@ async def ingest_postcall_event(event: dict[str, Any]) -> dict[str, Any]:
                 raise VoiceSessionError("Post-call audio is empty or exceeds the 32 MB archive limit.")
             relative = storage.save_bytes(f"voice/{session['id']}/{conversation_id}.mp3", audio)
             archive_run_id = await _queue_archive(conn, session_id=session["id"], audio_relative_path=relative)
+            # Consented path: keep a storage reference, never the raw base64.
+            await conn.execute(
+                "UPDATE voice_session_events SET payload = payload || jsonb_build_object('audio_ref', $2::text) WHERE id=$1",
+                inserted["id"],
+                relative,
+            )
         await conn.execute("UPDATE voice_session_events SET processed_at=now() WHERE id=$1", inserted["id"])
 
     return {
@@ -480,9 +600,32 @@ async def mark_archive_work(conn, work_id: int, *, result: dict[str, Any] | None
     return status
 
 
+async def reclaim_stale_archive_work(conn, stale_seconds: int | float | None = None) -> int:
+    """PR21-F7: return crashed ``running`` archive claims to ``pending`` (or ``dead``).
+
+    Mirrors the MSE ``work_queue`` reclaim. ``updated_at`` is bumped by trigger
+    on claim, so it marks when the current claim started.
+    """
+    seconds = float(settings.voice_work_queue_stale_seconds if stale_seconds is None else stale_seconds)
+    rows = await conn.fetch(
+        """
+        UPDATE voice_work_queue
+        SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
+            next_attempt_at = now(),
+            last_error = 'reclaimed stale running claim',
+            finished_at = CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END
+        WHERE status='running' AND updated_at < now() - make_interval(secs => $1)
+        RETURNING id
+        """,
+        seconds,
+    )
+    return len(rows)
+
+
 async def process_archive_queue(limit: int = 5) -> dict[str, int]:
     """Run pending archive jobs; invoked by the existing worker tick."""
     async with transaction() as conn:
+        reclaimed = await reclaim_stale_archive_work(conn)
         items = await claim_archive_work(conn, limit)
     done = failed = dead = 0
     for item in items:
@@ -502,11 +645,15 @@ async def process_archive_queue(limit: int = 5) -> dict[str, int]:
                 )
             failed += 1
             dead += int(status == "dead")
-    return {"claimed": len(items), "done": done, "failed": failed, "dead": dead}
+    return {"claimed": len(items), "done": done, "failed": failed, "dead": dead, "reclaimed": reclaimed}
 
 
 __all__ = [
+    "VoiceSessionConflict",
     "VoiceSessionError",
+    "redact_binary_fields",
+    "reclaim_stale_archive_work",
+    "storage_payload",
     "bind_conversation",
     "create_session",
     "get_session",
