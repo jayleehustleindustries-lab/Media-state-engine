@@ -12,6 +12,23 @@ class Settings(BaseSettings):
     elevenlabs_voice_id: str = ""
     elevenlabs_url: str = "https://api.elevenlabs.io/v1/text-to-speech"
     elevenlabs_webhook_secret: str = ""
+    # Job Command live voice — private ElevenLabs Conversational AI agent.
+    # The browser receives only a short-lived signed URL; the API key stays server-side.
+    elevenlabs_agents_api_url: str = "https://api.elevenlabs.io"
+    elevenlabs_agent_id: str = ""
+    elevenlabs_agents_webhook_secret: str = ""
+    voice_session_token_ttl_seconds: int = 900
+    job_command_operator_authorized: bool = False
+    job_command_owner_voice_ref: str = "operator-owned-voice"
+    job_command_owner_avatar_ref: str = "operator-owned-avatar"
+    job_command_default_language: str = "en"
+    job_command_supported_languages: str = "en,es,pt-BR"
+    job_command_asr_keywords: str = "Job Command"
+
+    # Gemini 3.5 Transcribe applies only to opted-in post-call archives.
+    # It is deliberately not a second live speech loop beside ElevenLabs.
+    gemini_transcribe_api_key: str = ""
+    gemini_transcribe_model: str = "gemini-3.5-transcribe"
 
     heygen_api_key: str = ""
     heygen_api_url: str = "https://api.heygen.com"

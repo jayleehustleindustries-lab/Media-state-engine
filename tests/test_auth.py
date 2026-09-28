@@ -9,8 +9,10 @@ from app.auth import is_public_path, ApiKeyMiddleware
 def test_health_is_public_path():
     assert is_public_path('/health')
     assert is_public_path('/webhooks/heygen')
+    assert is_public_path('/webhooks/elevenlabs/voice')
     assert not is_public_path('/jobs')
     assert not is_public_path('/jobs/x/reconcile')
+    assert not is_public_path('/voice/sessions')
 
 
 @pytest.fixture
