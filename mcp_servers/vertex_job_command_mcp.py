@@ -17,11 +17,20 @@ from typing import Any
 
 from google.cloud import pubsub_v1
 from mcp.server.fastmcp import FastMCP
+from pydantic import ValidationError
 
 try:  # Support both `python file.py` and `python -m mcp_servers.module`.
-    from .job_command_pipeline_policy import JobCommandEvent, canonical_event_payload, idempotency_key
+    from .job_command_pipeline_policy import (
+        PENDING_APPROVAL, RENDER_EVENT, JobCommandEvent, idempotency_key,
+        is_pending_approval, public_event_dict,
+    )
+    from . import job_command_campaign_store as campaign_store
 except ImportError:  # pragma: no cover - direct script entry point
-    from job_command_pipeline_policy import JobCommandEvent, canonical_event_payload, idempotency_key
+    from job_command_pipeline_policy import (
+        PENDING_APPROVAL, RENDER_EVENT, JobCommandEvent, idempotency_key,
+        is_pending_approval, public_event_dict,
+    )
+    import job_command_campaign_store as campaign_store
 
 
 mcp = FastMCP("Job Command Vertex Campaign Pipeline")
@@ -41,29 +50,46 @@ def _settings() -> tuple[str, str]:
     return project, topic
 
 
-def publish_event(event: JobCommandEvent) -> dict[str, Any]:
-    project, topic_name = _settings()
-    publisher = pubsub_v1.PublisherClient()
-    topic = publisher.topic_path(project, topic_name)
-    payload = canonical_event_payload(event)
-    future = publisher.publish(
-        topic,
-        payload,
-        event_type=event.event_type,
-        campaign_id=str(event.campaign_id),
-        event_id=str(event.event_id),
-        idempotency_key=idempotency_key(event),
-        source=event.source,
-        pipeline="job-command",
-    )
-    message_id = future.result(timeout=20)
-    return {
-        "pipeline": "job-command",
-        "topic": topic,
-        "message_id": message_id,
+def _attributes(event: JobCommandEvent) -> dict[str, str]:
+    attributes = {
+        "event_type": event.event_type,
+        "campaign_id": str(event.campaign_id),
         "event_id": str(event.event_id),
         "idempotency_key": idempotency_key(event),
-        "next": "Cloud Run workers may claim this event; rendering still requires the campaign approval gate.",
+        "source": event.source,
+        "pipeline": "job-command",
+    }
+    if event.event_type == RENDER_EVENT:
+        attributes["approval_ref"] = event.approval_ref or ""
+        attributes["approval_verified"] = "true"
+    return attributes
+
+
+async def publish_event(event: JobCommandEvent, *, store: "campaign_store.CampaignStore | None" = None) -> dict[str, Any]:
+    """Publish via the durable guards: dedupe + single-use approval spend.
+
+    The published body is ``canonical_event_payload`` (approval_token stripped).
+    """
+    project, topic_name = _settings()
+    topic_holder: dict[str, str] = {}
+
+    def _publish(payload: bytes, attributes: dict[str, str]) -> str:
+        publisher = pubsub_v1.PublisherClient()
+        topic = publisher.topic_path(project, topic_name)
+        topic_holder["topic"] = topic
+        return publisher.publish(topic, payload, **attributes).result(timeout=20)
+
+    result = await campaign_store.guarded_publish(
+        event, publish_fn=_publish, attributes=_attributes(event), store=store
+    )
+    return {
+        "pipeline": "job-command",
+        "topic": topic_holder.get("topic"),
+        "message_id": result["message_id"],
+        "duplicate": result["duplicate"],
+        "event_id": str(event.event_id),
+        "idempotency_key": result["idempotency_key"],
+        "next": "Cloud Run workers may claim this event. Render events are only published after a verified, single-use human approval record.",
     }
 
 
@@ -74,17 +100,41 @@ def validate_campaign_event(event: dict[str, Any]) -> dict[str, Any]:
     return {
         "valid": True,
         "pipeline": "job-command",
-        "event": parsed.model_dump(mode="json"),
+        "event": public_event_dict(parsed),  # never echo the approval token
         "idempotency_key": idempotency_key(parsed),
         "separation": "No JayLeeFit / Media State Engine identifiers are accepted.",
     }
 
 
 @mcp.tool()
-def publish_campaign_event(event: dict[str, Any]) -> dict[str, Any]:
-    """Publish one validated event to the dedicated Job Command Pub/Sub topic."""
-    parsed = JobCommandEvent.model_validate(event)
-    return publish_event(parsed)
+async def publish_campaign_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Publish one validated event to the dedicated Job Command Pub/Sub topic.
+
+    ``campaign.render_requested`` without a verified approval record is never
+    published; it is returned as ``pending_approval`` (PR21-F3, fail closed).
+    """
+    try:
+        parsed = JobCommandEvent.model_validate(event)
+    except ValidationError as exc:
+        if is_pending_approval(exc):
+            return {
+                "published": False,
+                "status": PENDING_APPROVAL,
+                "pipeline": "job-command",
+                "detail": "campaign.render_requested requires a verified human approval record.",
+            }
+        raise
+    try:
+        return await publish_event(parsed)
+    except campaign_store.ApprovalReplay:
+        return {
+            "published": False,
+            "status": PENDING_APPROVAL,
+            "pipeline": "job-command",
+            "detail": "This approval was already used; a new human approval is required.",
+        }
+    except campaign_store.PublishInProgress:
+        return {"published": False, "status": "in_progress", "pipeline": "job-command"}
 
 
 @mcp.tool()

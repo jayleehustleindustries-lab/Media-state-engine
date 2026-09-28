@@ -18,12 +18,13 @@ class ElevenLabsAgentNotConfigured(ElevenLabsAgentError):
 
 
 def _configured() -> tuple[str, str, str]:
-    api_key = (settings.elevenlabs_api_key or "").strip()
+    # PR21-F2: dedicated Agents key only; never fall back to the MSE TTS key.
+    api_key = (settings.elevenlabs_agents_api_key or "").strip()
     agent_id = (settings.elevenlabs_agent_id or "").strip()
     base_url = (settings.elevenlabs_agents_api_url or "https://api.elevenlabs.io").rstrip("/")
     if not api_key or not agent_id:
         raise ElevenLabsAgentNotConfigured(
-            "Job Command live voice is not configured: set ELEVENLABS_API_KEY and ELEVENLABS_AGENT_ID."
+            "Job Command live voice is not configured: set ELEVENLABS_AGENTS_API_KEY and ELEVENLABS_AGENT_ID."
         )
     return api_key, agent_id, base_url
 
@@ -68,7 +69,8 @@ def verify_postcall_webhook(raw_body: bytes, signature: str | None) -> dict[str,
     timestamp against the raw body.  This fails closed if the SDK or secret is
     absent rather than accepting a request with an incompatible signature shape.
     """
-    secret = (settings.elevenlabs_agents_webhook_secret or settings.elevenlabs_webhook_secret or "").strip()
+    # PR21-F2: no fallback to the MSE TTS webhook secret (separate trust domain).
+    secret = (settings.elevenlabs_agents_webhook_secret or "").strip()
     if not secret:
         raise ElevenLabsAgentError("ElevenLabs Agents webhook secret is not configured.")
     if not signature:
@@ -79,7 +81,7 @@ def verify_postcall_webhook(raw_body: bytes, signature: str | None) -> dict[str,
     except ImportError as exc:  # pragma: no cover - dependency contract
         raise ElevenLabsAgentError("ElevenLabs SDK is not installed for webhook verification.") from exc
     try:
-        client = ElevenLabs(api_key=(settings.elevenlabs_api_key or "").strip())
+        client = ElevenLabs(api_key=(settings.elevenlabs_agents_api_key or "").strip())
         event = client.webhooks.construct_event(
             rawBody=raw_body.decode("utf-8"),
             sig_header=signature,

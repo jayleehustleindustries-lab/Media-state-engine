@@ -43,7 +43,8 @@ def build_transcription_config(*, mode: str, custom_vocabulary: list[str]) -> di
 
 
 def _transcribe_sync(audio_path: str, *, mode: str, custom_vocabulary: list[str]) -> dict[str, Any]:
-    api_key = (settings.gemini_transcribe_api_key or settings.gemini_api_key or "").strip()
+    # PR21-F2: no fallback to the MSE image-gate GEMINI_API_KEY.
+    api_key = (settings.gemini_transcribe_api_key or "").strip()
     if not api_key:
         raise GeminiTranscribeNotConfigured("Gemini archive transcription is not configured: set GEMINI_TRANSCRIBE_API_KEY.")
     if not Path(audio_path).is_file():

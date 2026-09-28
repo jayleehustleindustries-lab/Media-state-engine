@@ -18,6 +18,19 @@ def client():
             yield test_client
 
 
+JOB_COMMAND_TEST_KEY = "jc-test-key-distinct-from-mse"
+
+
+@pytest.fixture
+def job_command_on(monkeypatch):
+    """PR21-F2: Job Command routes are flag-gated and use their own API key."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_command_voice_enabled", True)
+    monkeypatch.setattr(settings, "job_command_api_key", JOB_COMMAND_TEST_KEY)
+    return JOB_COMMAND_TEST_KEY
+
+
 def test_router_uses_only_configured_language_profile():
     route = voice_router.route_job_command(
         requested_language="es-MX",
@@ -163,14 +176,18 @@ async def test_verified_transcription_event_is_idempotent_and_stores_turns(voice
     assert session["state"] == "completed"
 
 
-def test_voice_session_endpoint_requires_engine_key(client):
+def test_voice_session_endpoint_requires_engine_key(client, job_command_on):
+    import os
+
     response = client.post("/voice/sessions", json={})
     assert response.status_code == 401
+    # PR21-F2: the shared MSE key is no longer accepted for Job Command routes.
+    mse = client.post("/voice/sessions", headers={"X-API-Key": os.environ["MEDIA_ENGINE_API_KEY"]}, json={})
+    assert mse.status_code == 401
 
 
-def test_voice_session_endpoint_maps_mocked_provider_response(client):
-    import os
-    key = os.environ["MEDIA_ENGINE_API_KEY"]
+def test_voice_session_endpoint_maps_mocked_provider_response(client, job_command_on):
+    key = job_command_on
     response_payload = {
         "session": {"id": "00000000-0000-0000-0000-000000000123", "resolved_language": "en", "state": "issued"},
         "connection": {"signed_url": "wss://api.elevenlabs.test/token", "expires_at": "2026-01-01T00:00:00+00:00", "conversation_init": {}},
@@ -188,7 +205,7 @@ def test_voice_session_endpoint_maps_mocked_provider_response(client):
     mock_create.assert_awaited_once()
 
 
-def test_voice_webhook_rejects_invalid_provider_signature(client):
+def test_voice_webhook_rejects_invalid_provider_signature(client, job_command_on):
     with patch(
         "app.api.voice.elevenlabs_agents.verify_postcall_webhook",
         side_effect=__import__("app.services.elevenlabs_agents", fromlist=["ElevenLabsAgentError"]).ElevenLabsAgentError("Invalid ElevenLabs webhook signature or payload."),

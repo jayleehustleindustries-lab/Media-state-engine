@@ -15,8 +15,27 @@ class Settings(BaseSettings):
     # Job Command live voice — private ElevenLabs Conversational AI agent.
     # The browser receives only a short-lived signed URL; the API key stays server-side.
     elevenlabs_agents_api_url: str = "https://api.elevenlabs.io"
+    # PR21-F2: dedicated ElevenLabs Agents credential. There is deliberately NO
+    # fallback to the MSE TTS key (ELEVENLABS_API_KEY) or TTS webhook secret.
+    elevenlabs_agents_api_key: str = ""
     elevenlabs_agent_id: str = ""
     elevenlabs_agents_webhook_secret: str = ""
+    # PR21-F2: Job Command voice routes are OFF unless explicitly enabled and
+    # authenticate with their own key (never MEDIA_ENGINE_API_KEY / API_KEY).
+    job_command_voice_enabled: bool = False
+    job_command_api_key: str = ""
+    # PR21-F4: bound ElevenLabs signed-URL minting (fail closed). Attempts are
+    # counted before the provider call, so failed mints still consume budget.
+    job_command_voice_daily_mint_cap: int = 50
+    job_command_voice_rate_window_seconds: int = 60
+    job_command_voice_rate_limit_per_key: int = 10
+    job_command_voice_rate_limit_per_ip: int = 10
+    job_command_voice_rate_limit_per_visitor: int = 3
+    # Only honour the left-most X-Forwarded-For hop when the deployment's proxy
+    # is trusted to overwrite it. Default: use the socket peer address.
+    job_command_trust_forwarded_for: bool = False
+    # PR21-F7: reclaim crashed voice_work_queue claims after this many seconds.
+    voice_work_queue_stale_seconds: int = 900
     voice_session_token_ttl_seconds: int = 900
     job_command_operator_authorized: bool = False
     job_command_owner_voice_ref: str = "operator-owned-voice"
@@ -113,6 +132,10 @@ class Settings(BaseSettings):
     @property
     def effective_api_key(self) -> str:
         return (self.media_engine_api_key or self.api_key or "").strip()
+
+    @property
+    def effective_job_command_api_key(self) -> str:
+        return (self.job_command_api_key or "").strip()
 
     @property
     def effective_heygen_callback_url(self) -> str:

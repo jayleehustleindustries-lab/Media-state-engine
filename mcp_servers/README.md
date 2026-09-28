@@ -2,10 +2,12 @@
 
 These are **two separate systems**. They share no queue, storage bucket, database, service account, API key, or deployment target with each other or with the JayLeeFit media pipeline.
 
+> **Scope note (PR #21 audit):** the statement above covers these two MCP/campaign components only. The Job Command *live voice* backend (`/voice/*`) currently still runs inside the Media State Engine API process, Postgres database, and worker. It is feature-flagged OFF by default and uses its own API key and provider credentials, but full infrastructure separation (own DB/worker/deployment) is a tracked follow-up.
+
 | Component | What it does | What it cannot do |
 | --- | --- | --- |
 | **Grok Code Healer** | Reads an allowlisted Git working tree, runs bounded checks, and asks Grok for a structured remediation proposal. | It cannot merge, push, deploy, alter a default branch, access a repository outside its allowlisted root, or apply a patch by default. |
-| **Job Command Vertex Campaign Pipeline** | Validates a signed Job Command event and publishes it to a dedicated `job-command-*` Pub/Sub topic. Eventarc delivers it to a separate Cloud Run orchestrator for approved clip planning and rendering. | It rejects JayLeeFit/Media State Engine references, accepts no cross-project IAM grants, does not capture personalized pages, and cannot publish a clip without a human approval event. |
+| **Job Command Vertex Campaign Pipeline** | Validates a signed Job Command event and publishes it to a dedicated `job-command-*` Pub/Sub topic. Eventarc delivers it to a separate Cloud Run orchestrator for approved clip planning and rendering. | It rejects JayLeeFit/Media State Engine references in metadata, `page_url`, `route`, and `visitor_ref`; only accepts capture/render targets on a config-driven host + exact-route allowlist (default deny); accepts no cross-project IAM grants; and refuses to publish `campaign.render_requested` unless it carries a verified, signed human approval record (otherwise `pending_approval`, nothing published). |
 
 ## Recommended deployment choice
 
@@ -62,6 +64,18 @@ Landing-page CTA (after notice and consent)
 
 The event must have its own UUID, a Job Command campaign UUID, and an allowlisted event type. The ingress rejects personal/legacy cross-pipeline fields and only permits approved public routes for capture.
 
+Enforced in `job_command_pipeline_policy.py` (shared by ingress and MCP):
+
+| Control | Config | Behavior |
+| --- | --- | --- |
+| Capture allowlist | `JOB_COMMAND_CAPTURE_ALLOWED_HOSTS`, `JOB_COMMAND_CAPTURE_ALLOWED_ROUTES` (comma lists, exact match) | `capture_requested`, `clip_brief_requested`, `render_requested` need `https`, allowlisted host, allowlisted route, `page_url` path == `route`, no query/fragment/credentials/port. Empty config denies all. |
+| Isolation scan | — | Normalized (case/punctuation/percent-decoding) scan of metadata keys+values, `page_url`, `route`, `visitor_ref` for JayLeeFit / Media State / HeyGen-id aliases. |
+| Render approval | `JOB_COMMAND_APPROVAL_SECRET` (must differ from `JOB_COMMAND_INGRESS_SECRET`) | `render_requested` needs `approval_ref` + `approval_token` signed by the operator approval workflow (`mint_approval_token`), bound to the campaign, `status=approved`, unexpired, TTL ≤ 24h. Otherwise ingress returns **409 `pending_approval`** and the MCP returns `{"published": false, "status": "pending_approval"}`. |
+| Single-use approvals | `JOB_COMMAND_CAMPAIGN_DATABASE_URL` (dedicated DB/role; **no** fallback to MSE `DATABASE_URL`) | Each approval is spent once in `job_command_spent_approvals` (PK sha256(token), UNIQUE(campaign_id, approval_id)), in the same transaction as the publish claim. Another event reusing it → **409 `pending_approval`** (`reason: approval_spent`). A retry of the *same* event is allowed. |
+| Publish idempotency | same DSN | `job_command_publish_log` (PK `idempotency_key`) is claimed before Pub/Sub publish; a retry of a published event returns the prior `message_id` (`duplicate: true`) without republishing; a concurrent in-flight duplicate → 409 `in_progress`; stale `pending` claims (>300 s) are reclaimed. Store unset → **503, nothing published**. |
+| Token hygiene | — | The verified `approval_token` is stripped from the Pub/Sub body, the idempotency hash, MCP tool responses, error messages and reprs; only its sha256 is stored. |
+| Ingress status codes | — | 401 = bad HMAC only; 400 = invalid payload (no input echo); 409 = pending approval / in progress; 503 = store unset or publish failure. |
+
 ```json
 {
   "event_id": "e7f60cac-6ea6-4f2d-9c22-7880c57c2aac",
@@ -77,7 +91,7 @@ The event must have its own UUID, a Job Command campaign UUID, and an allowliste
 }
 ```
 
-**Capture rule:** only capture an explicitly approved public or sanitized staging route. Never capture a signed-in dashboard, client plan, checkout, video session, voice transcript, or any page containing personalized data. The pipeline prepares vertical 9:16 clip briefs; a separate approval record is required before any render or publication.
+**Capture rule:** only capture an explicitly approved public or sanitized staging route. Never capture a signed-in dashboard, client plan, checkout, video session, voice transcript, or any page containing personalized data. The pipeline prepares vertical 9:16 clip briefs; a separate, signed, single-use approval record is required before any render request is published. Approval signing is still symmetric HMAC (verifiers could mint); asymmetric/KMS signing is a follow-up. The Terraform module does not yet provision the campaign database.
 
 ### Deploy the isolated infrastructure
 
