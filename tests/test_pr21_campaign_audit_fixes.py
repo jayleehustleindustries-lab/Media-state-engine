@@ -130,14 +130,14 @@ def test_f3_approval_requested_events_remain_publishable(allowlist, secrets):
     JobCommandEvent.model_validate(_event(event_type="campaign.approval_requested"))
 
 
-def test_f3_mcp_publish_returns_pending_and_never_publishes(allowlist, secrets, monkeypatch):
+async def test_f3_mcp_publish_returns_pending_and_never_publishes(allowlist, secrets, monkeypatch):
     from mcp_servers import vertex_job_command_mcp as mcp_mod
 
     def _boom(*a, **k):
         raise AssertionError("PublisherClient must not be constructed for an unapproved render")
 
     monkeypatch.setattr(mcp_mod.pubsub_v1, "PublisherClient", _boom)
-    result = mcp_mod.publish_campaign_event(_event(event_type="campaign.render_requested"))
+    result = await mcp_mod.publish_campaign_event(_event(event_type="campaign.render_requested"))
     assert result == {
         "published": False,
         "status": "pending_approval",
@@ -161,7 +161,29 @@ class _FakePublisher:
 
 
 @pytest.fixture
-def ingress(monkeypatch, allowlist, secrets):
+def campaign_db(require_database_url, monkeypatch):
+    """Fresh schema (all SoT migrations incl. 009) + campaign store DSN (PR22-F2/F6)."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    import asyncpg
+    from tests.conftest import apply_schema, truncate_app_tables
+
+    async def _reset():
+        conn = await asyncpg.connect(require_database_url)
+        try:
+            await apply_schema(conn)
+            await truncate_app_tables(conn)
+        finally:
+            await conn.close()
+
+    with ThreadPoolExecutor(1) as pool:
+        pool.submit(asyncio.run, _reset()).result()
+    monkeypatch.setenv("JOB_COMMAND_CAMPAIGN_DATABASE_URL", require_database_url)
+    return require_database_url
+
+
+@pytest.fixture
+def ingress(monkeypatch, allowlist, secrets, campaign_db):
     from fastapi.testclient import TestClient
     from mcp_servers import job_command_vertex_ingress as ingress_mod
 
@@ -176,6 +198,7 @@ def _post(client, payload, secret=INGRESS_SECRET, raw=None):
     return client.post("/events", content=body, headers={"x-job-command-signature": sig})
 
 
+@pytest.mark.postgres
 def test_f3_ingress_unapproved_render_is_409_pending_and_not_published(ingress):
     client, publisher = ingress
     response = _post(client, _event(event_type="campaign.render_requested"))
@@ -185,6 +208,7 @@ def test_f3_ingress_unapproved_render_is_409_pending_and_not_published(ingress):
     assert publisher.calls == []
 
 
+@pytest.mark.postgres
 def test_f3_ingress_approved_render_publishes_with_approval_attribute(ingress):
     client, publisher = ingress
     response = _post(client, _render())
@@ -197,6 +221,7 @@ def test_f3_ingress_approved_render_publishes_with_approval_attribute(ingress):
 
 # -------------------------------------------------------------- F12 ------
 
+@pytest.mark.postgres
 def test_f12_ingress_status_codes(ingress):
     client, publisher = ingress
     assert _post(client, _event(), secret="wrong-secret").status_code == 401

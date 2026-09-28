@@ -71,7 +71,10 @@ Enforced in `job_command_pipeline_policy.py` (shared by ingress and MCP):
 | Capture allowlist | `JOB_COMMAND_CAPTURE_ALLOWED_HOSTS`, `JOB_COMMAND_CAPTURE_ALLOWED_ROUTES` (comma lists, exact match) | `capture_requested`, `clip_brief_requested`, `render_requested` need `https`, allowlisted host, allowlisted route, `page_url` path == `route`, no query/fragment/credentials/port. Empty config denies all. |
 | Isolation scan | — | Normalized (case/punctuation/percent-decoding) scan of metadata keys+values, `page_url`, `route`, `visitor_ref` for JayLeeFit / Media State / HeyGen-id aliases. |
 | Render approval | `JOB_COMMAND_APPROVAL_SECRET` (must differ from `JOB_COMMAND_INGRESS_SECRET`) | `render_requested` needs `approval_ref` + `approval_token` signed by the operator approval workflow (`mint_approval_token`), bound to the campaign, `status=approved`, unexpired, TTL ≤ 24h. Otherwise ingress returns **409 `pending_approval`** and the MCP returns `{"published": false, "status": "pending_approval"}`. |
-| Ingress status codes | — | 401 = bad HMAC only; 400 = invalid payload; 409 = pending approval; 503 = publish failure. |
+| Single-use approvals | `JOB_COMMAND_CAMPAIGN_DATABASE_URL` (dedicated DB/role; **no** fallback to MSE `DATABASE_URL`) | Each approval is spent once in `job_command_spent_approvals` (PK sha256(token), UNIQUE(campaign_id, approval_id)), in the same transaction as the publish claim. Another event reusing it → **409 `pending_approval`** (`reason: approval_spent`). A retry of the *same* event is allowed. |
+| Publish idempotency | same DSN | `job_command_publish_log` (PK `idempotency_key`) is claimed before Pub/Sub publish; a retry of a published event returns the prior `message_id` (`duplicate: true`) without republishing; a concurrent in-flight duplicate → 409 `in_progress`; stale `pending` claims (>300 s) are reclaimed. Store unset → **503, nothing published**. |
+| Token hygiene | — | The verified `approval_token` is stripped from the Pub/Sub body, the idempotency hash, MCP tool responses, error messages and reprs; only its sha256 is stored. |
+| Ingress status codes | — | 401 = bad HMAC only; 400 = invalid payload (no input echo); 409 = pending approval / in progress; 503 = store unset or publish failure. |
 
 ```json
 {
@@ -88,7 +91,7 @@ Enforced in `job_command_pipeline_policy.py` (shared by ingress and MCP):
 }
 ```
 
-**Capture rule:** only capture an explicitly approved public or sanitized staging route. Never capture a signed-in dashboard, client plan, checkout, video session, voice transcript, or any page containing personalized data. The pipeline prepares vertical 9:16 clip briefs; a separate, signed approval record is required before any render request is published. Durable single-use approval records (replay protection within the approval TTL) and publish idempotency dedupe are follow-ups.
+**Capture rule:** only capture an explicitly approved public or sanitized staging route. Never capture a signed-in dashboard, client plan, checkout, video session, voice transcript, or any page containing personalized data. The pipeline prepares vertical 9:16 clip briefs; a separate, signed, single-use approval record is required before any render request is published. Approval signing is still symmetric HMAC (verifiers could mint); asymmetric/KMS signing is a follow-up. The Terraform module does not yet provision the campaign database.
 
 ### Deploy the isolated infrastructure
 

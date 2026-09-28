@@ -65,7 +65,10 @@ class JobCommandEvent(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     # PR21-F3: render events must carry a signed approval record.
     approval_ref: str | None = Field(default=None, max_length=128)
-    approval_token: str | None = Field(default=None, max_length=4096)
+    # repr=False keeps the bearer token out of reprs/log lines. It is verified in
+    # the validator and NEVER published or persisted (PR22-F1): see
+    # canonical_event_payload / public_event_dict.
+    approval_token: str | None = Field(default=None, max_length=4096, repr=False)
 
     @field_validator("event_type")
     @classmethod
@@ -288,9 +291,41 @@ def verify_hmac(raw_body: bytes, signature: str | None, secret: str) -> None:
         raise ValueError("Invalid ingress signature.")
 
 
+# PR22-F1: bearer/secret material that must never leave the verification step
+# (Pub/Sub bodies, idempotency hashes, MCP tool responses, durable stores).
+NON_PUBLISHABLE_FIELDS = frozenset({"approval_token"})
+
+
+def public_event_dict(event: JobCommandEvent) -> dict[str, Any]:
+    """Event as JSON-safe dict with approval bearer material removed."""
+    return event.model_dump(mode="json", exclude=set(NON_PUBLISHABLE_FIELDS))
+
+
 def canonical_event_payload(event: JobCommandEvent) -> bytes:
-    """Canonical JSON for Pub/Sub publication and idempotency hashing."""
-    return json.dumps(event.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    """Canonical JSON for Pub/Sub publication and idempotency hashing.
+
+    The verified ``approval_token`` is stripped (PR22-F1); downstream consumers
+    get ``approval_ref`` plus the ``approval_verified`` attribute instead.
+    """
+    return json.dumps(public_event_dict(event), sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def approval_token_sha256(event: JobCommandEvent) -> str | None:
+    """Digest used as the durable single-use spend key (never the token itself)."""
+    if not event.approval_token:
+        return None
+    return sha256(event.approval_token.encode("utf-8")).hexdigest()
+
+
+def validation_error_detail(exc: Exception) -> str:
+    """Client-safe error text that never echoes input values (e.g. tokens)."""
+    if isinstance(exc, ValidationError):
+        return "; ".join(
+            str(err.get("msg", "invalid")) for err in exc.errors(include_url=False, include_input=False)
+        )[:1000]
+    if isinstance(exc, json.JSONDecodeError):
+        return "body is not valid JSON"
+    return str(exc)[:1000]
 
 
 def idempotency_key(event: JobCommandEvent) -> str:

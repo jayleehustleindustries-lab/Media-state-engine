@@ -17,14 +17,16 @@ from google.cloud import pubsub_v1
 
 try:  # Support both `uvicorn mcp_servers...` and direct script execution.
     from .job_command_pipeline_policy import (
-        PENDING_APPROVAL, RENDER_EVENT, JobCommandEvent, canonical_event_payload,
-        idempotency_key, is_pending_approval, verify_hmac,
+        PENDING_APPROVAL, RENDER_EVENT, JobCommandEvent, idempotency_key,
+        is_pending_approval, validation_error_detail, verify_hmac,
     )
+    from . import job_command_campaign_store as campaign_store
 except ImportError:  # pragma: no cover - direct script entry point
     from job_command_pipeline_policy import (
-        PENDING_APPROVAL, RENDER_EVENT, JobCommandEvent, canonical_event_payload,
-        idempotency_key, is_pending_approval, verify_hmac,
+        PENDING_APPROVAL, RENDER_EVENT, JobCommandEvent, idempotency_key,
+        is_pending_approval, validation_error_detail, verify_hmac,
     )
+    import job_command_campaign_store as campaign_store
 
 
 app = FastAPI(title="Job Command Vertex Ingress", version="1.0.0")
@@ -44,6 +46,14 @@ def _publisher() -> tuple[pubsub_v1.PublisherClient, str]:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "pipeline": "job-command"}
+
+
+def _pending_response(detail: str, reason: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"accepted": False, "published": False, "status": PENDING_APPROVAL,
+                 "reason": reason, "detail": detail},
+    )
 
 
 def publish_attributes(event: JobCommandEvent) -> dict[str, str]:
@@ -76,23 +86,40 @@ async def receive_event(request: Request) -> Any:
     except (ValueError, json.JSONDecodeError) as exc:
         if is_pending_approval(exc):
             # PR21-F3: fail closed — nothing is published without approval.
-            return JSONResponse(
-                status_code=409,
-                content={"accepted": False, "published": False, "status": PENDING_APPROVAL,
-                         "detail": "campaign.render_requested requires a verified human approval record."},
+            return _pending_response(
+                "campaign.render_requested requires a verified human approval record.", "approval_required"
             )
-        raise HTTPException(400, f"Invalid Job Command event: {exc}"[:1000]) from exc
+        # Never echo input values (they may contain the approval token).
+        raise HTTPException(400, f"Invalid Job Command event: {validation_error_detail(exc)}") from exc
 
     try:
+        store = campaign_store.store_from_env()
+    except campaign_store.CampaignStoreNotConfigured as exc:
+        # PR22-F2/F6: without the durable store there is no single-use spend or
+        # dedupe, so nothing is published (fail closed).
+        raise HTTPException(503, "Campaign event store is not configured.") from exc
+
+    def _publish(payload: bytes, attributes: dict[str, str]) -> str:
         publisher, topic = _publisher()
-        future = publisher.publish(topic, canonical_event_payload(event), **publish_attributes(event))
-        message_id = future.result(timeout=20)
+        return publisher.publish(topic, payload, **attributes).result(timeout=20)
+
+    try:
+        result = await campaign_store.guarded_publish(
+            event, publish_fn=_publish, attributes=publish_attributes(event), store=store
+        )
+    except campaign_store.ApprovalReplay:
+        return _pending_response("This approval was already used; a new human approval is required.", "approval_spent")
+    except campaign_store.PublishInProgress:
+        return JSONResponse(status_code=409, content={"accepted": False, "published": False,
+                                                      "status": "in_progress",
+                                                      "idempotency_key": idempotency_key(event)})
     except Exception as exc:  # publishing failure must trigger Vercel retry logic
         raise HTTPException(503, "Campaign event enqueue failed.") from exc
     return {
         "accepted": True,
         "pipeline": "job-command",
         "event_id": str(event.event_id),
-        "message_id": message_id,
-        "idempotency_key": idempotency_key(event),
+        "message_id": result["message_id"],
+        "duplicate": result["duplicate"],
+        "idempotency_key": result["idempotency_key"],
     }

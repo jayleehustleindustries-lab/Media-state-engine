@@ -339,6 +339,20 @@ def _event_key(event: dict[str, Any]) -> str:
     return f"{event_type}:{conversation_id}:{stamp}"
 
 
+def _turn_meta(item: dict[str, Any]) -> dict[str, Any]:
+    """PR22-F4: transcript-turn meta never carries audio.
+
+    Audio-named keys are dropped outright and any other binary/base64 blob is
+    redacted, so ``voice_transcript_turns.meta`` cannot become a side channel.
+    """
+    kept = {
+        k: v for k, v in item.items()
+        if k not in {"message", "text", "transcript"}
+        and not (isinstance(k, str) and k.lower() in AUDIO_FIELD_NAMES)
+    }
+    return redact_binary_fields(kept)
+
+
 def _turns(event: dict[str, Any]) -> list[dict[str, Any]]:
     data = event.get("data") if isinstance(event.get("data"), dict) else {}
     transcript = data.get("transcript")
@@ -351,6 +365,8 @@ def _turns(event: dict[str, Any]) -> list[dict[str, Any]]:
         text = item.get("message") or item.get("text") or item.get("transcript") or ""
         if not isinstance(text, str) or not text.strip():
             continue
+        if _looks_like_blob(text.strip()):
+            text = "[redacted binary content]"  # PR22-F4: never store a blob as "text"
         raw_role = str(item.get("role") or item.get("source") or "unknown").lower()
         role = "agent" if raw_role in {"agent", "ai"} else "user" if raw_role in {"user", "customer"} else "unknown"
         turns.append({
@@ -361,7 +377,7 @@ def _turns(event: dict[str, Any]) -> list[dict[str, Any]]:
             "text": text.strip(),
             "start_ms": item.get("start_ms") or item.get("start_time_ms"),
             "end_ms": item.get("end_ms") or item.get("end_time_ms"),
-            "meta": {k: v for k, v in item.items() if k not in {"message", "text", "transcript"}},
+            "meta": _turn_meta(item),
         })
     return turns
 
