@@ -30,6 +30,14 @@ Any active state → failed. Terminal: delivered, failed.
 `staged` = awaiting human approval. `approved → delivered` runs only via
 the distribute worker after `/approve`.
 
+Dramatic finish is a **local operator step** on the rendered MP4, between
+`rendered` and approve. It does not add a status and does not post.
+See [`docs/DRAMATIC_FINISH.md`](docs/DRAMATIC_FINISH.md).
+
+```bash
+python scripts/dramatic_finish.py INPUT.mp4 -o finished.mp4
+```
+
 ## Local setup
 
 Python 3.11+, Postgres with `pgcrypto`.
@@ -56,8 +64,9 @@ Docker / Railway use port **8080**. Health: `GET /health`.
    `script_ready`.
 2. `POST /jobs/{id}/generate-avatar` (and/or `generate-audio` / `render`) →
    **202** with `work_id`; worker performs provider I/O.
-3. After render, job is **`staged`** (awaiting approval). Review via
-   `GET /jobs/{id}/detail`.
+3. After render, job is **`staged`** (awaiting approval). Optional local
+   finish: `python scripts/dramatic_finish.py` on the rendered MP4, then
+   review via `GET /jobs/{id}/detail`.
 4. `POST /jobs/{id}/approve` — sets audit fields, enqueues `distribute`.
 5. Worker distribute: YouTube live when OAuth + local MP4 exist; otherwise
    staging under `data/staging/{job_id}/`. TikTok/Reels captions stay
@@ -122,3 +131,4 @@ pytest -q
 | 3 Script quality, dual-format guard, approve gate | [PHASE3_REPORT.md](PHASE3_REPORT.md) |
 | 4 Scheduler, YouTube distribute, metrics | [PHASE4_REPORT.md](PHASE4_REPORT.md) |
 | 5 Deploy docs, SoT, audit F1–F5 fixes | [PHASE5_REPORT.md](PHASE5_REPORT.md) |
+| Finish pass (local, no new status) | [docs/DRAMATIC_FINISH.md](docs/DRAMATIC_FINISH.md) |
