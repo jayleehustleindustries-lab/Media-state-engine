@@ -15,7 +15,7 @@ from typing import Any
 
 from .config import settings
 from .db import connect, close, transaction
-from .services import queue, pipeline, outbox
+from .services import queue, pipeline, outbox, voice_sessions
 
 log = logging.getLogger("media_state.worker")
 
@@ -113,7 +113,10 @@ async def process_work_item(item: dict[str, Any]) -> None:
 
 async def tick(*, also_reconcile: bool = False) -> dict[str, int]:
     """One worker cycle: reclaim stale claims, claim work, process, flush outbox."""
-    stats: dict = {"claimed": 0, "processed": 0, "outbox": {}, "reclaimed_work": 0, "reclaimed_outbox": 0}
+    stats: dict = {
+        "claimed": 0, "processed": 0, "outbox": {}, "reclaimed_work": 0,
+        "reclaimed_outbox": 0, "voice_archive": {},
+    }
     # Audit F4: always reclaim crashed running/delivering before claiming
     async with transaction() as conn:
         rw = await queue.reclaim_stale_running(conn)
@@ -125,6 +128,15 @@ async def tick(*, also_reconcile: bool = False) -> dict[str, int]:
     for item in items:
         await process_work_item(item)
         stats["processed"] += 1
+
+    # Voice archives are deliberately separate from render job work: no archive
+    # is queued without per-session consent and a failed archive cannot block a
+    # live conversation or a paid avatar render.
+    # PR21-F2: Job Command voice work only runs when its feature flag is on.
+    if settings.job_command_voice_enabled:
+        stats["voice_archive"] = await voice_sessions.process_archive_queue(
+            limit=settings.worker_batch_size
+        )
 
     stats["outbox"] = await outbox.flush_outbox(limit=20)
 
@@ -160,7 +172,11 @@ async def run_forever() -> None:
                 stats = await tick(also_reconcile=do_recon)
                 if do_recon:
                     last_reconcile = now
-                if stats["claimed"] == 0 and not stats["outbox"].get("claimed"):
+                if (
+                    stats["claimed"] == 0
+                    and stats["voice_archive"].get("claimed", 0) == 0
+                    and not stats["outbox"].get("claimed")
+                ):
                     try:
                         await asyncio.wait_for(
                             _stop.wait(),

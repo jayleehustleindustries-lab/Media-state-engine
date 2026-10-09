@@ -1,0 +1,10 @@
+# Project-scoped Grok MCP configuration.
+# No secret is stored here. Grok expands XAI_API_KEY from the runtime environment.
+# Code Healer is review-first and must be run against a non-default Git branch.
+
+[mcp_servers.code_healer]
+command = "python3"
+args = ["mcp_servers/grok_code_healer.py"]
+env = { CODE_HEAL_ALLOWED_ROOT = "${PWD}", GROK_CODE_HEAL_ALLOW_WRITES = "false" }
+startup_timeout_sec = 30
+tool_timeout_sec = 6000

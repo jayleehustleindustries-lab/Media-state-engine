@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from .db import connect, close
 from .api.jobs import router as jobs_router
+from .api.voice import router as voice_router
 from .auth import ApiKeyMiddleware
 
 
@@ -15,8 +16,7 @@ async def lifespan(app):
 app = FastAPI(title='Media State Engine', version='1.4.0', lifespan=lifespan)
 app.add_middleware(ApiKeyMiddleware)
 app.include_router(jobs_router)
-
-
+app.include_router(voice_router)
 @app.get('/health')
 async def health():
     return {'status': 'ok'}

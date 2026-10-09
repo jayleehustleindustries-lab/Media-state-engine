@@ -11,6 +11,7 @@ applied in lexical order by the repository script:
 4. `supabase/migrations/20260317000004_image_gate.sql`
 5. `supabase/migrations/20260317000005_image_gate_caps.sql`
 6. `supabase/migrations/20260317000006_webhook_outbox_adjunct.sql`
+7. `supabase/migrations/20260317000007_job_command_voice.sql`
 
 ```bash
 export DATABASE_URL=postgresql://...
@@ -54,6 +55,14 @@ service from the same image with start command `python -m app.worker`
 - `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` / `YOUTUBE_REFRESH_TOKEN` for live Shorts; omit for staging-only
 - `YOUTUBE_PRIVACY_STATUS` — default `private`
 - `WORKER_*`, `STUCK_JOB_SECONDS`, `WORK_QUEUE_STALE_SECONDS`, `OUTBOX_STALE_SECONDS`
+
+### Job Command live voice
+
+- Keep `ELEVENLABS_API_KEY`, `ELEVENLABS_AGENTS_WEBHOOK_SECRET`, and `GEMINI_TRANSCRIBE_API_KEY` in the deployment secret store only.
+- Set `ELEVENLABS_AGENT_ID` to a **private** ElevenLabs Agent configured with approved language presets and the language-detection tool.
+- Set `JOB_COMMAND_OPERATOR_AUTHORIZED=true` only after verifying the configured voice/avatar are operator-owned and approved. The API fail-closes without this flag.
+- Point ElevenLabs post-call webhooks to `POST /webhooks/elevenlabs/voice` with HMAC signing enabled. The endpoint verifies raw bytes before storage and queues Gemini only for sessions that opted into archive processing.
+- Let the Vercel application authenticate the browser user before calling `POST /voice/sessions`; only return the signed URL to that user. See `docs/JOB_COMMAND_LIVE_VOICE.md` for the endpoint contract.
 
 ### Scheduler (API admin tick or CLI)
 
