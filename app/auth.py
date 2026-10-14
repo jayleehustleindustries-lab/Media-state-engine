@@ -17,7 +17,7 @@ _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # Paths that stay public (health + inbound provider webhooks).
 PUBLIC_PREFIXES = ("/health", "/docs", "/openapi.json", "/redoc")
-PUBLIC_EXACT = {"/", "/favicon.ico"}
+PUBLIC_EXACT = {"/", "/avatar", "/favicon.ico"}
 WEBHOOK_PREFIX = "/webhooks/"
 
 

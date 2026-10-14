@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Avatar Intake | Media State Engine</title>
+  <style>
+    :root { --ink:#ececf5; --muted:#a6a5b8; --panel:rgba(18,20,34,.88); --line:rgba(255,255,255,.13); --violet:#8d7aff; --cyan:#61d6ff; --good:#79e4ad; --warn:#ffc56d; --bad:#ff7b8b; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; color:var(--ink); background:radial-gradient(circle at 15% 12%,rgba(102,82,255,.28),transparent 30%),radial-gradient(circle at 85% 84%,rgba(37,189,230,.20),transparent 32%),#090a12; font:15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }
+    main { max-width:1080px; margin:0 auto; padding:52px 24px 72px; }
+    .eyebrow { color:var(--cyan); font-weight:800; letter-spacing:.12em; font-size:.74rem; text-transform:uppercase; }
+    h1 { max-width:850px; margin:.4rem 0 .8rem; font-size:clamp(2.2rem,6vw,4.4rem); line-height:1.02; letter-spacing:-.06em; }
+    .lede { max-width:750px; color:var(--muted); font-size:1.06rem; }
+    .grid { display:grid; grid-template-columns:1.4fr .86fr; gap:20px; margin-top:34px; }
+    .panel { border:1px solid var(--line); border-radius:20px; background:linear-gradient(145deg,rgba(35,37,60,.94),var(--panel)); box-shadow:0 18px 80px rgba(0,0,0,.35); padding:24px; }
+    h2 { margin:0 0 6px; font-size:1.16rem; letter-spacing:-.025em; }
+    .note, small { color:var(--muted); }
+    label { display:block; margin:20px 0 7px; color:#dbdaeb; font-weight:720; font-size:.88rem; }
+    input, textarea { width:100%; color:var(--ink); background:#10121e; border:1px solid #393c55; border-radius:12px; padding:12px 13px; outline:none; font:inherit; transition:.15s border, .15s box-shadow; }
+    input:focus, textarea:focus { border-color:var(--violet); box-shadow:0 0 0 3px rgba(141,122,255,.18); }
+    textarea { min-height:114px; resize:vertical; }
+    .secure { display:flex; gap:10px; align-items:center; margin-top:18px; padding:12px; border-radius:12px; color:#b9b6e9; background:rgba(141,122,255,.09); border:1px solid rgba(141,122,255,.25); font-size:.86rem; }
+    .consent { display:flex; gap:10px; align-items:flex-start; margin:18px 0; color:#d0cfdf; font-size:.9rem; }
+    .consent input { width:17px; height:17px; margin:2px 0 0; accent-color:var(--violet); }
+    .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:20px; }
+    button { border:0; cursor:pointer; border-radius:12px; padding:12px 16px; color:#11101a; background:linear-gradient(135deg,var(--cyan),var(--violet)); font-weight:850; font:inherit; }
+    button.secondary { color:#e4e3f0; background:#25283a; border:1px solid #444860; }
+    button:disabled { opacity:.47; cursor:not-allowed; }
+    .quality { display:grid; gap:12px; margin-top:14px; }
+    .quality div { padding:13px; border-radius:12px; background:rgba(255,255,255,.035); border:1px solid var(--line); }
+    .quality b { display:block; margin-bottom:2px; color:#f0eff9; }
+    .quality p { margin:0; color:var(--muted); font-size:.89rem; }
+    .result { display:none; margin-top:20px; padding:14px; border-radius:12px; white-space:pre-wrap; word-break:break-word; color:#d7d6e9; background:#0d0f19; border:1px solid var(--line); font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .result.ok { border-color:rgba(121,228,173,.55); } .result.error { border-color:rgba(255,123,139,.7); color:#ffd0d5; }
+    .status { display:none; margin-top:14px; color:var(--muted); }
+    .badge { display:inline-block; margin:0 0 12px; padding:4px 9px; border-radius:99px; color:#87e8b1; background:rgba(121,228,173,.10); border:1px solid rgba(121,228,173,.28); font-size:.76rem; font-weight:800; }
+    ul { padding-left:19px; color:var(--muted); font-size:.9rem; } li+li { margin-top:9px; }
+    @media(max-width:780px) { main { padding:34px 16px 50px; } .grid { grid-template-columns:1fr; } .panel { padding:18px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">HeyGen Photo Avatar · strict identity intake</div>
+    <h1>Build the look before you animate it.</h1>
+    <p class="lede">Paste a public photo link into the secure intake field. The engine validates the file, corrects only its camera orientation, and losslessly normalizes it for HeyGen—never cropping, stretching, smoothing, or changing the person's facial geometry.</p>
+    <div class="grid">
+      <section class="panel">
+        <h2>Avatar source vault</h2>
+        <p class="note">The HeyGen key stays on the server. Your engine access key is used only in this browser request and is never saved by this page.</p>
+        <label for="engineKey">Engine access key</label>
+        <input id="engineKey" type="password" autocomplete="off" placeholder="Paste your Media State Engine access key">
+        <label for="avatarName">Avatar name</label>
+        <input id="avatarName" type="text" maxlength="120" placeholder="e.g., Jordan — Studio Anchor">
+        <label for="photoLinks">Photo link field</label>
+        <textarea id="photoLinks" spellcheck="false" placeholder="Paste public HTTPS image links here — one link per line.\n\nThe first link is the identity anchor. The rest are reviewed as supporting references for future Looks."></textarea>
+        <div class="secure"><span>▣</span><span>Accepts JPG/JPEG, PNG, WebP, GIF, TIFF, BMP, HEIC/HEIF, and AVIF when the link resolves to image bytes. HeyGen receives a lossless PNG asset; the original URL is not retained.</span></div>
+        <label class="consent"><input id="consent" type="checkbox"><span>I own this image or have the person's explicit permission and rights to create and use this avatar.</span></label>
+        <div class="actions">
+          <button class="secondary" id="preflight" type="button">Run strict preflight</button>
+          <button id="create" type="button" disabled>Create HeyGen Photo Avatar</button>
+        </div>
+        <div id="status" class="status"></div>
+        <pre id="result" class="result" aria-live="polite"></pre>
+      </section>
+      <aside class="panel">
+        <span class="badge">QUALITY FLOOR</span>
+        <h2>The no-distortion standard</h2>
+        <div class="quality">
+          <div><b>Image integrity</b><p>At least 1080 px on the short edge and 2 MP. No resize or crop is applied. Under-spec images are blocked.</p></div>
+          <div><b>Lighting + depth</b><p>Soft, even front/45° key light; clean separation from the background; natural skin tone; shoulders and upper torso visible.</p></div>
+          <div><b>Symmetry + identity</b><p>Eye-level camera, no wide-angle selfie lens, centered head, visible jawline/forehead/eyes/mouth, and a neutral expression for the primary anchor.</p></div>
+          <div><b>Best frame</b><p>Vertical 4:5 to 9:16, single person, uncluttered background. Add a clean 3/4 and full-body reference in the extra lines for planned Looks.</p></div>
+        </div>
+        <h2 style="margin-top:24px">What the system does—and does not—guarantee</h2>
+        <ul>
+          <li>It preserves image geometry and blocks objectively low-resolution files.</li>
+          <li>It cannot honestly guarantee “zero distortion” in a generative video; clean source capture minimizes risk, then HeyGen output must be reviewed before production use.</li>
+          <li>A Photo Avatar creates from one primary photo. Supporting links are preflighted but never silently blended into identity.</li>
+        </ul>
+      </aside>
+    </div>
+  </main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let preflightPassed = false;
+  function requestBody() {
+    const links = $('photoLinks').value.split(/\n|,/).map(s => s.trim()).filter(Boolean);
+    return { name: $('avatarName').value.trim(), primary_photo_url: links[0] || '', reference_photo_urls: links.slice(1), confirmed_likeness_rights: $('consent').checked };
+  }
+  function show(value, type='') { const el=$('result'); el.className='result '+type; el.style.display='block'; el.textContent=typeof value==='string' ? value : JSON.stringify(value,null,2); }
+  async function call(path) {
+    const key=$('engineKey').value.trim(); const body=requestBody();
+    if (!key) throw new Error('Enter the Media State Engine access key. The HeyGen key is never requested here.');
+    if (!body.name || !body.primary_photo_url) throw new Error('Enter an avatar name and at least one public HTTPS photo link.');
+    if (!body.confirmed_likeness_rights) throw new Error('Confirm likeness rights before continuing.');
+    $('status').style.display='block'; $('status').textContent='Checking source integrity…';
+    const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':key},body:JSON.stringify(body)});
+    const data=await response.json().catch(()=>({detail:'Unexpected response'}));
+    if(!response.ok) throw new Error(data.detail || 'Request failed.');
+    return data;
+  }
+  $('preflight').addEventListener('click', async () => {
+    preflightPassed=false; $('create').disabled=true;
+    try { const data=await call('/avatars/photo/preflight'); preflightPassed=Boolean(data.can_create); $('create').disabled=!preflightPassed; $('status').textContent=preflightPassed ? 'Strict preflight passed. Review the manual checks, then create the avatar.' : 'Preflight did not reach the strict fidelity floor.'; show(data,preflightPassed?'ok':'error'); }
+    catch(err) { $('status').textContent='Preflight stopped.'; show(err.message,'error'); }
+  });
+  $('create').addEventListener('click', async () => {
+    if(!preflightPassed) return;
+    $('create').disabled=true;
+    try { const data=await call('/avatars/photo'); $('status').textContent='Avatar request sent to HeyGen. Check its status before using the returned avatar ID.'; show(data,'ok'); }
+    catch(err) { $('status').textContent='Avatar creation stopped.'; show(err.message,'error'); $('create').disabled=false; }
+  });
+</script>
+</body>
+</html>
