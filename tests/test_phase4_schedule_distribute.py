@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
-from uuid import uuid4
 
 import pytest
 
@@ -211,7 +210,7 @@ async def test_distribute_live_youtube_marks_shorts_published(pg_pool, tmp_path,
 async def test_metrics_endpoint_and_counters(pg_pool):
     from app.services import jobs, metrics, scheduler
     from fastapi.testclient import TestClient
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import patch
 
     await jobs.create_job(topic="metrics job")
     await scheduler.tick(count=1, force=True)
@@ -238,7 +237,7 @@ async def test_metrics_endpoint_and_counters(pg_pool):
 @pytest.mark.asyncio
 async def test_scheduler_admin_tick_auth():
     from fastapi.testclient import TestClient
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import patch
 
     key = os.environ["MEDIA_ENGINE_API_KEY"]
     with patch("app.main.connect", new_callable=AsyncMock), patch("app.main.close", new_callable=AsyncMock):

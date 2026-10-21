@@ -128,7 +128,6 @@ async def test_f4_reclaim_stale_work_and_outbox(pg_pool):
 async def test_f3_youtube_idempotent_skips_second_upload(pg_pool, tmp_path, monkeypatch):
     from app.config import settings
     from app.services import jobs, pipeline
-    from app.services.distribute.base import DistributeResult
     from app.state_machine import advance
     from app.db import transaction
 

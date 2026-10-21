@@ -1,7 +1,6 @@
 """Simple local (or pluggable) object storage for generated media bytes."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from ..config import settings
