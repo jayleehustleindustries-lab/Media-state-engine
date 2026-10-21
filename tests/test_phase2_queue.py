@@ -1,7 +1,6 @@
 """Phase 2: Postgres work queue, async enqueue API, job detail, worker tick."""
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -179,7 +178,6 @@ async def test_api_generate_audio_returns_202(pg_pool):
     from fastapi.testclient import TestClient
     from unittest.mock import AsyncMock, patch
     import os
-    from uuid import uuid4
 
     key = os.environ["MEDIA_ENGINE_API_KEY"]
     job_id = uuid4()
@@ -252,7 +250,6 @@ async def test_heygen_create_video_includes_callback_url(monkeypatch):
     from app.services import heygen
     from app.config import settings
     from unittest.mock import patch
-    from uuid import uuid4
 
     monkeypatch.setattr(settings, "heygen_api_key", "test-key")
     monkeypatch.setattr(settings, "heygen_avatar_id", "av1")

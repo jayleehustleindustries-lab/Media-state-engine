@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
-from app.auth import is_public_path, ApiKeyMiddleware
+from app.auth import is_public_path
 
 
 def test_health_is_public_path():

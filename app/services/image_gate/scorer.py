@@ -52,7 +52,6 @@ def _clamp(n: float) -> float:
 
 
 def _parse_score_payload(data: dict[str, Any], scorer: str) -> ScoreCard:
-    missing = [a for a in AXES if a not in data and a.replace("_", "") not in data]
     # allow short aliases
     aliases = {
         "face_consistency": ["face_consistency", "face", "avatar_consistency"],

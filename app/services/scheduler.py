@@ -7,7 +7,7 @@ Nothing public-posts without the Phase 3 approve gate.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
