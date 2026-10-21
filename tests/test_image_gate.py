@@ -8,11 +8,11 @@ from uuid import uuid4
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+# asyncio_mode=auto (pytest.ini) handles async tests; no module-level mark needed.
 
 REPO = Path(__file__).resolve().parents[1]
 REF_PACK = REPO / "reference_images" / "ACTIVE_REFERENCE_SET.json"
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql:///media_state")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 
 def _card(**overrides):
@@ -35,12 +35,13 @@ def _card(**overrides):
 
 
 async def _fresh_conn():
+    if not DATABASE_URL:
+        pytest.skip("DATABASE_URL not set — skipping real Postgres tests")
     import asyncpg
     return await asyncpg.connect(DATABASE_URL)
 
 
 async def _seed_job(conn, script=None):
-    from uuid import uuid4
     script = script or f"Hook {uuid4().hex[:8]}. Body ships. CTA follow now."
     row = await conn.fetchrow(
         "SELECT * FROM create_job($1::text, $2::text, NULL::text, NULL::text, 'heygen'::renderer_type)",
